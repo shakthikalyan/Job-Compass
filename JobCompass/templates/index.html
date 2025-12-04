@@ -1,0 +1,249 @@
+
+{% extends "base.html" %}
+{% block content %}
+<!-- HERO -->
+<section class="relative overflow-hidden pt-12 pb-16">
+  <div class="absolute inset-0 bg-gradient-to-br from-indigo-50 to-cyan-50 opacity-60 pointer-events-none"></div>
+
+  <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 relative z-10">
+    <div class="text-center max-w-4xl mx-auto">
+      <div class="inline-flex items-center justify-center px-3 py-1 rounded-full bg-white/60 shadow-sm mb-6">
+        <svg class="w-4 h-4 mr-2 text-indigo-500" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 5v14M5 12h14"/></svg>
+        <span class="text-xs font-semibold text-indigo-600">AI-powered Career Guidance</span>
+      </div>
+
+      <h1 class="text-4xl sm:text-5xl lg:text-6xl font-extrabold tracking-tight text-slate-900">
+        Discover your <span class="text-transparent bg-clip-text bg-gradient-to-r from-blue-500 to-cyan-400">Job Readiness</span> Score
+      </h1>
+
+      <p class="mt-6 text-lg sm:text-xl text-slate-600 max-w-3xl mx-auto">
+        Match your skills against any job posting instantly. Get intelligent gap analysis, discover transferable skills, and receive personalized tips to strengthen your applications and land your dream role.
+      </p>
+
+      <div class="mt-8 flex flex-col sm:flex-row items-center justify-center gap-4">
+        <a href="{% url 'upload_resume' %}" class="inline-flex items-center gap-3 px-6 py-3 rounded-full bg-gradient-to-r from-indigo-600 to-cyan-500 text-white shadow-lg transform hover:scale-[1.02] transition">
+          <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 4v16M4 12h16" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>
+          Analyze Job Match
+        </a>
+
+        <a href="{% url 'nl_query' %}" class="inline-flex items-center gap-2 px-5 py-3 rounded-full bg-white border border-slate-200 text-slate-700 hover:shadow">
+          <svg class="w-4 h-4 text-slate-500" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M14.752 11.168l-3.197-1.86A1 1 0 0010 10.04v3.92a1 1 0 001.556.832l3.197-1.86a1 1 0 000-1.664z" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>
+          Ask Career Questions
+        </a>
+      </div>
+
+      <div class="mt-8 flex items-center justify-center gap-6 text-sm text-slate-500">
+        {# Safe rendering for total resumes: prefer stats if present, otherwise fallback to resumes|length #}
+        {% if stats.total_resumes is defined %}
+          <div><strong class="text-slate-800">{{ stats.total_resumes }}</strong> Job Matches Analyzed</div>
+        {% else %}
+          <div><strong class="text-slate-800">{{ resumes|length }}</strong> Job Matches Analyzed</div>
+        {% endif %}
+
+        <div>•</div>
+
+        {% if stats.total_jobs is defined %}
+          <div><strong class="text-slate-800">{{ stats.total_jobs }}</strong>  Career decisions guided</div>
+        {% else %}
+          <div><strong class="text-slate-800">{{ jobs|length }}</strong> Career decisions guided</div>
+        {% endif %}
+
+        <div>•</div>
+
+        <div><strong class="text-slate-800">{{ stats.avg_match_score|default:"—" }}</strong> avg match</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- 3 STEP BENEFITS (cards) -->
+<section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 -mt-6 mb-12">
+  <div class="grid grid-cols-1 md:grid-cols-3 gap-6">
+    <!-- Card 1 -->
+    <article class="bg-white rounded-2xl p-8 shadow-lg hover:shadow-xl transition transform md:scale-100">
+      <div class="flex items-center justify-center w-14 h-14 rounded-xl bg-emerald-50 mb-4 mx-auto">
+        <!-- file icon -->
+        <svg class="w-7 h-7 text-emerald-600" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>
+      </div>
+      <h4 class="text-center font-semibold text-slate-900">Upload Your Resume</h4>
+      <p class="mt-3 text-slate-500 text-sm text-left">
+        Get started by uploading your resume. We parse your skills, projects, and experience automatically, setting the foundation for intelligent job matching
+      </p>
+      <div class="mt-6 text-center">
+        <p class="inline-block px-4 py-2 rounded-full bg-emerald-600 text-white text-sm shadow-sm">Get Started</p>
+      </div>
+    </article>
+
+    <!-- Card 2 -->
+    <article class="bg-white rounded-2xl p-8 shadow-lg hover:shadow-xl transition transform md:scale-100">
+      <div class="flex items-center justify-center w-14 h-14 rounded-xl bg-orange-50 mb-4 mx-auto">
+        <!-- analyze icon -->
+        <svg class="w-7 h-7 text-orange-600" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M3 3v18h18" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/><path d="M7 13h4v6H7zM13 7h4v12h-4z" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>
+      </div>
+      <h4 class="text-center font-semibold text-slate-900">Check Job Match</h4>
+      <p class="mt-3 text-slate-500 text-sm">
+        Paste any job description to get an instant 0-10 match score. See which skills you have, what's missing, and discover transferable skills you can highlight from your experience.
+      </p>
+      <div class="mt-6 text-center">
+        <p  class="inline-block px-4 py-2 rounded-full bg-orange-100 text-orange-700 text-sm">Match Against Job</p>
+      </div>
+    </article>
+
+    <!-- Card 3 -->
+    <article class="bg-white rounded-2xl p-8 shadow-lg hover:shadow-xl transition transform md:scale-100">
+      <div class="flex items-center justify-center w-14 h-14 rounded-xl bg-violet-50 mb-4 mx-auto">
+        <!-- tailor icon -->
+        <svg class="w-7 h-7 text-violet-600" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 2l3 7h7l-5.5 4.5L19 21l-7-4-7 4 2.5-7.5L2 9h7z" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>
+      </div>
+      <h4 class="text-center font-semibold text-slate-900">Get Actionable Tips</h4>
+      <p class="mt-3 text-slate-500 text-sm">
+        Get ONE high-impact recommendation per job: reframe your project descriptions, highlight overlooked skills, or learn what's critical. Plus, ask career questions like 'Am I ready for data science roles?'
+      </p>
+      <div class="mt-6 text-center">
+        <p class="inline-block px-4 py-2 rounded-full bg-violet-600 text-white text-sm shadow-sm">Ask AI Assistant</p>
+      </div>
+    </article>
+  </div>
+</section>
+
+<!-- FEATURE HIGHLIGHTS + VISUAL -->
+<section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mb-12">
+  <div class="grid grid-cols-1 lg:grid-cols-3 gap-8 items-center">
+    <div class="lg:col-span-2 bg-white rounded-2xl p-8 shadow-lg">
+      <h3 class="text-2xl font-semibold text-slate-900">What the system does — under the hood</h3>
+      <p class="mt-3 text-slate-600">Designed for real hiring workflows, the pipeline uses structured parsing and deterministic logic to give reliable, actionable outputs:</p>
+
+      <div class="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
+        <div class="p-4 rounded-lg border border-slate-100">
+          <div class="font-medium text-slate-800">Resume Parsing</div>
+          <div class="text-sm text-slate-500 mt-2">Extracts technical & soft skills, experiences, projects, education and certifications using a configurable LLM prompt or local heuristics.</div>
+        </div>
+
+        <div class="p-4 rounded-lg border border-slate-100">
+          <div class="font-medium text-slate-800">Job Parsing</div>
+          <div class="text-sm text-slate-500 mt-2">Categorizes critical vs beneficial skills and pulls years/levels from job descriptions to enable accurate matching.</div>
+        </div>
+
+        <div class="p-4 rounded-lg border border-slate-100">
+          <div class="font-medium text-slate-800">Semantic Match</div>
+          <div class="text-sm text-slate-500 mt-2">Weighted scoring (critical 60%, beneficial 20%, experience 15%, projects 5%) returns a 0–10 score and评级 (Excellent / Strong / Moderate / Weak).</div>
+        </div>
+
+        <div class="p-4 rounded-lg border border-slate-100">
+          <div class="font-medium text-slate-800">Gap Analysis & Recommendation</div>
+          <div class="text-sm text-slate-500 mt-2">Prioritized gaps (missing / transferable / learnable) and a single high-impact recommendation (reframe, highlight, add, or learn).</div>
+        </div>
+      </div>
+
+      <div class="mt-6">
+        <h4 class="font-medium text-slate-800">Why this matters</h4>
+        <ul class="mt-3 list-disc pl-5 text-sm text-slate-600 space-y-2">
+          <li>Reduce time-to-apply with immediate resume edits and reframing suggestions.</li>
+          <li>Improve ATS pass rates by surfacing exact and semantic keyword matches.</li>
+          <li>Get prioritized, actionable guidance — not long generic lists.</li>
+        </ul>
+      </div>
+    </div>
+
+    <!-- Visual / Results -->
+    <aside class="bg-white rounded-2xl p-6 shadow-lg">
+      <div class="flex items-center justify-between">
+        <div>
+          <div class="text-xs text-slate-500">Live result</div>
+          <div class="text-2xl font-semibold text-slate-900 mt-1">{{ stats.avg_match_score|default:"—" }}</div>
+          <div class="text-sm text-slate-500">Average match</div>
+        </div>
+        <div class="w-36">
+          <canvas id="resultDonut" data-skills='{{ skill_counts|default:"[]"|safe }}' height="120"></canvas>
+        </div>
+      </div>
+
+      <div class="mt-6 text-sm text-slate-600">
+        <div class="font-medium">Recent outcomes</div>
+        <ul class="mt-3 space-y-2">
+          {% for m in recent_matches %}
+            <li class="flex items-center justify-between">
+              <div class="text-sm text-slate-700">{{ m.job|default:"Job" }}</div>
+              <div class="text-sm font-semibold">{{ m.score }}</div>
+            </li>
+          {% empty %}
+            <li class="text-slate-400">No recent matches — run one now.</li>
+          {% endfor %}
+        </ul>
+      </div>
+
+      <div class="mt-6">
+        <a href="{% url 'nl_query' %}" class="block text-center px-4 py-2 rounded-full bg-indigo-600 text-white">Try readiness check</a>
+      </div>
+    </aside>
+  </div>
+</section>
+
+<!-- DETAILED RESULTS / CALL OUTS -->
+<section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mb-20">
+  <div class="bg-gradient-to-tr from-indigo-50 to-white rounded-3xl p-8 shadow-inner">
+    <h3 class="text-xl font-semibold text-slate-900">Results you can expect</h3>
+    <div class="mt-4 grid grid-cols-1 md:grid-cols-3 gap-6">
+      <div class="p-4 bg-white rounded-lg shadow">
+        <div class="text-sm font-semibold text-slate-800">Higher ATS pass rate</div>
+        <div class="text-sm text-slate-500 mt-2">By highlighting exact & semantic matches and rephrasing projects into metrics-first lines.</div>
+      </div>
+      <div class="p-4 bg-white rounded-lg shadow">
+        <div class="text-sm font-semibold text-slate-800">Faster applications</div>
+        <div class="text-sm text-slate-500 mt-2">One recommended change gets you application-ready in under 10 minutes.</div>
+      </div>
+      <div class="p-4 bg-white rounded-lg shadow">
+        <div class="text-sm font-semibold text-slate-800">Targeted learning plan</div>
+        <div class="text-sm text-slate-500 mt-2">When gaps are learnable, the system recommends a concise roadmap to close them quickly.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- FOOT CTA -->
+<section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mb-16">
+  <div class="bg-white rounded-2xl p-8 flex flex-col md:flex-row items-center justify-between gap-6 shadow-lg">
+    <div>
+      <h4 class="text-2xl font-semibold text-slate-900">Ready to tailor your resume?</h4>
+      <p class="text-sm text-slate-600 mt-2">Upload a resume and a job description — get a prioritized change you can apply immediately.</p>
+    </div>
+    <div class="flex gap-3">
+      <a href="{% url 'upload_resume' %}" class="px-5 py-3 rounded-full bg-cyan-500 text-white shadow">Upload Resume</a>
+      <a href="{% url 'upload_job' %}" class="px-5 py-3 rounded-full bg-white border border-slate-200 text-slate-700">Upload Job</a>
+    </div>
+  </div>
+</section>
+
+<!-- Chart.js render -->
+<script>
+(function(){
+  // donut showing skill_counts or fallback
+  const donut = document.getElementById('resultDonut');
+  if (donut) {
+    let raw = donut.dataset.skills || '[]';
+    let data = JSON.parse(raw || '[]');
+    const labels = data.length ? data.map(x=>x.skill) : ['No data'];
+    const counts = data.length ? data.map(x=>x.count) : [1];
+    new Chart(donut.getContext('2d'), {
+      type: 'doughnut',
+      data: {
+        labels,
+        datasets: [{ data: counts, borderWidth: 0 }]
+      },
+      options: {
+        cutout: '70%',
+        plugins: { legend: { display: false } }
+      }
+    });
+  }
+
+  // small soft animation for hero CTA
+  const cta = document.querySelectorAll('a[href$="upload_resume/"]');
+  if (cta.length) {
+    cta.forEach(el => el.animate([{ transform: 'translateY(0)' }, { transform: 'translateY(-3px)' }], { duration: 900, iterations: Infinity, direction: 'alternate' }));
+  }
+})();
+</script>
+{% endblock %}
+
+

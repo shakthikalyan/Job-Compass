@@ -1,0 +1,43 @@
+
+{% extends "base.html" %}
+{% block content %}
+<div class="max-w-3xl mx-auto">
+  <div class="bg-white rounded-2xl shadow-lg p-8">
+    <div class="flex items-start gap-4">
+      <div class="w-14 h-14 flex items-center justify-center rounded-lg bg-emerald-50">
+        <svg xmlns="http://www.w3.org/2000/svg" class="w-7 h-7 text-emerald-600" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M9 12h6m2 0a6 6 0 11-12 0 6 6 0 0112 0z" />
+        </svg>
+      </div>
+      <div>
+        <h2 class="text-xl font-semibold">Upload a job description</h2>
+        <p class="text-sm text-slate-500">Paste job text or upload a file. We'll extract critical vs beneficial skills, years and responsibilities.</p>
+      </div>
+    </div>
+
+    <form class="mt-6" method="post" enctype="multipart/form-data">{% csrf_token %}
+      <div class="grid grid-cols-1 gap-4">
+        <label class="block">
+          <span class="text-sm font-medium text-slate-700">Title</span>
+          <div class="mt-2">{{ form.title }}</div>
+        </label>
+
+        <label class="block">
+          <span class="text-sm font-medium text-slate-700">File (optional)</span>
+          <div class="mt-2">{{ form.file }}</div>
+        </label>
+
+        <label class="block">
+          <span class="text-sm font-medium text-slate-700">Job text (optional)</span>
+          <div class="mt-2">{{ form.raw_text }}</div>
+        </label>
+
+        <div class="flex items-center gap-3">
+          <button class="px-4 py-2 bg-emerald-600 text-white rounded-md shadow hover:bg-emerald-500">Upload & Parse</button>
+          <a href="{% url 'index' %}" class="text-sm text-slate-500 hover:underline">Back to Dashboard</a>
+        </div>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

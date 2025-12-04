@@ -1,22 +1,54 @@
-"""
-URL configuration for JobCompass project.
+# """
+# URL configuration for JobCompass project.
 
-The `urlpatterns` list routes URLs to views. For more information please see:
-    https://docs.djangoproject.com/en/5.2/topics/http/urls/
-Examples:
-Function views
-    1. Add an import:  from my_app import views
-    2. Add a URL to urlpatterns:  path('', views.home, name='home')
-Class-based views
-    1. Add an import:  from other_app.views import Home
-    2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
-Including another URLconf
-    1. Import the include() function: from django.urls import include, path
-    2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
-"""
+# The `urlpatterns` list routes URLs to views. For more information please see:
+#     https://docs.djangoproject.com/en/5.2/topics/http/urls/
+# Examples:
+# Function views
+#     1. Add an import:  from my_app import views
+#     2. Add a URL to urlpatterns:  path('', views.home, name='home')
+# Class-based views
+#     1. Add an import:  from other_app.views import Home
+#     2. Add a URL to urlpatterns:  path('', Home.as_view(), name='home')
+# Including another URLconf
+#     1. Import the include() function: from django.urls import include, path
+#     2. Add a URL to urlpatterns:  path('blog/', include('blog.urls'))
+# """
+# from django.contrib import admin
+# from django.urls import path
+# from App import views
+
+# urlpatterns = [
+#     path('admin/', admin.site.urls),
+#     path('', views.index, name='index'),
+#     path('resume/upload/', views.upload_resume, name='upload_resume'),
+#     path('resume/<uuid:resume_id>/', views.resume_detail, name='resume_detail'),
+#     path('job/upload/', views.upload_job, name='upload_job'),
+#     path('job/<uuid:job_id>/', views.job_detail, name='job_detail'),
+#     path('match/<uuid:resume_id>/<uuid:job_id>/', views.compute_match, name='compute_match'),
+#     path('gaps/<int:match_id>/', views.gaps_view, name='gaps'),
+#     path('recommendation/<int:match_id>/', views.recommendation_view, name='recommendation'),
+#     path('nl_query/', views.nl_query, name='nl_query'),
+# ]
+
 from django.contrib import admin
 from django.urls import path
+from App import views
 
 urlpatterns = [
     path('admin/', admin.site.urls),
+    path('', views.index, name='index'),
+
+    path('resume/upload/', views.upload_resume, name='upload_resume'),
+    path('resume/<uuid:resume_id>/', views.resume_detail, name='resume_detail'),
+
+    path('job/upload/', views.upload_job, name='upload_job'),
+    path('job/<uuid:job_id>/', views.job_detail, name='job_detail'),
+
+    path('match/<uuid:resume_id>/<uuid:job_id>/', views.compute_match, name='compute_match'),
+    path('gaps/<int:match_id>/', views.gaps_view, name='gaps'),
+    path('recommendation/<int:match_id>/', views.recommendation_view, name='recommendation'),
+
+    path('nl_query/', views.nl_query, name='nl_query'),
 ]
+

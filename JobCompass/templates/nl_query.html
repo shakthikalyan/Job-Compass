@@ -1,0 +1,40 @@
+
+{% extends "base.html" %}
+{% block content %}
+<div class="max-w-3xl mx-auto">
+  <div class="bg-white rounded-2xl shadow p-6">
+    <h2 class="text-xl font-semibold">Ask a question (Natural language)</h2>
+    <p class="text-sm text-slate-500 mt-1">Ask about readiness, skill roadmaps, or request application advice — the system will combine parsed resume & job info for a personalized answer.</p>
+
+    <form method="post" class="mt-4">{% csrf_token %}
+      <div class="grid grid-cols-1 gap-3">
+        <div>
+          {{ form.query }}
+        </div>
+        <div class="flex gap-2">
+          <button class="px-4 py-2 bg-indigo-600 text-white rounded">Ask</button>
+          <a class="px-4 py-2 bg-slate-100 rounded" href="{% url 'index' %}">Dashboard</a>
+        </div>
+      </div>
+    </form>
+
+    {% if answer %}
+      <div class="mt-6 bg-slate-50 p-4 rounded-lg">
+        <div class="text-xs text-slate-500">Intent: {{ answer.intent }}</div>
+        <div class="mt-2 text-slate-800">
+          {# If answer.answer is a list, render bullets; else render text #}
+          {% if answer.answer is iterable and answer.answer|stringformat:"s" != answer.answer %}
+            <ul class="list-disc pl-6 space-y-2">
+              {% for item in answer.answer %}
+                <li>{{ item }}</li>
+              {% endfor %}
+            </ul>
+          {% else %}
+            <div>{{ answer.answer }}</div>
+          {% endif %}
+        </div>
+      </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

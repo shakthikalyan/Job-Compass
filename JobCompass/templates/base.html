@@ -1,22 +1,85 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Job Compass</title>
-    <!-- TailwindCSS via CDN -->
-    <script src="https://cdn.tailwindcss.com"></script>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>{{ page_title|default:"Career Compass" }}</title>
+
+  <!-- Tailwind Play CDN (dev / prototype) -->
+  <script src="https://cdn.tailwindcss.com"></script>
+
+  <!-- Chart.js for visualizations -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+  <style>
+    /* subtle glass card */
+    .glass {
+      background: rgba(255,255,255,0.7);
+      backdrop-filter: blur(6px);
+    }
+    /* small utility for truncated code blocks */
+    .pre-scroll { max-height: 320px; overflow:auto; white-space:pre-wrap; }
+  </style>
 </head>
-<body class="bg-gray-100 text-gray-900">
-    <header class="bg-blue-600 text-white p-4">
-        <h1 class="text-center text-2xl font-bold">Job Compass</h1>
-    </header>
-    <main class="container mx-auto p-4">
-        {% block content %}
-        {% endblock %}
-    </main>
-    <footer class="bg-blue-600 text-white p-4 text-center">
-        <p>&copy; 2025 Job Compass. All rights reserved.</p>
-    </footer>
+<body class="bg-gradient-to-b from-slate-50 to-white text-slate-800 min-h-screen antialiased">
+
+  <!-- Top nav -->
+  <header class="w-full border-b border-slate-200 bg-white/60 sticky top-0 z-40">
+    <div class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+      <div class="flex items-center justify-between h-16">
+        <div class="flex items-center gap-3">
+          <a href="{% url 'index' %}" class="flex items-center gap-3">
+            <!-- logo -->
+            <div class="w-10 h-10 rounded-lg bg-gradient-to-tr from-indigo-600 to-cyan-400 flex items-center justify-center text-white shadow">
+              <svg xmlns="http://www.w3.org/2000/svg" class="w-6 h-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
+                <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 4v16m8-8H4"/>
+              </svg>
+            </div>
+            <div class="text-lg font-semibold tracking-tight text-slate-900">Career Compass</div>
+          </a>
+        </div>
+
+        <nav class="hidden md:flex items-center gap-4">
+          <a href="{% url 'upload_resume' %}" class="px-3 py-2 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-100">Upload Resume</a>
+          <a href="{% url 'upload_job' %}" class="px-3 py-2 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-100">Upload Job</a>
+          <a href="{% url 'nl_query' %}" class="px-3 py-2 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-100">Ask Questions</a>
+        </nav>
+
+        <div class="flex items-center gap-3">
+          <a href="{% url 'admin:index' %}" class="text-sm text-slate-600 hover:underline hidden sm:inline">Admin</a>
+          <button class="p-2 rounded-md hover:bg-slate-100" aria-label="Profile">
+            <div class="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center text-slate-600">S</div>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <!-- Make navbar opaque on scroll -->
+    <script>
+      document.addEventListener('scroll', () => {
+        const header = document.querySelector('header');
+        if (window.scrollY > 10) {
+          header.classList.add('bg-white', 'shadow-md');
+          header.classList.remove('bg-white/60');
+        } else {
+          header.classList.add('bg-white/60');
+          header.classList.remove('bg-white', 'shadow-md');
+        }
+      });
+    </script>
+  </header>
+
+  <!-- Main content area -->
+  <main class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+    {% block content %}{% endblock %}
+  </main>
+
+  {% comment %} <footer class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 text-sm text-slate-500">
+    <div class="flex flex-col md:flex-row items-center justify-between gap-3">
+      <div>© {{ now.year }} Career Compass • Built with ♥</div>
+      
+    </div>
+  </footer> {% endcomment %}
+
 </body>
 </html>
