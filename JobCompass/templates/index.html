@@ -1,4 +1,3 @@
-
 {% extends "base.html" %}
 {% block content %}
 <!-- HERO -->
@@ -21,7 +20,7 @@
       </p>
 
       <div class="mt-8 flex flex-col sm:flex-row items-center justify-center gap-4">
-        <a href="{% url 'upload_resume' %}" class="inline-flex items-center gap-3 px-6 py-3 rounded-full bg-gradient-to-r from-indigo-600 to-cyan-500 text-white shadow-lg transform hover:scale-[1.02] transition">
+        <a href="{% url 'analyze_job_fit' %}" class="inline-flex items-center gap-3 px-6 py-3 rounded-full bg-gradient-to-r from-indigo-600 to-cyan-500 text-white shadow-lg transform hover:scale-[1.02] transition">
           <svg class="w-5 h-5" viewBox="0 0 24 24" fill="none" stroke="currentColor"><path d="M12 4v16M4 12h16" stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"/></svg>
           Analyze Job Match
         </a>
@@ -48,9 +47,9 @@
           <div><strong class="text-slate-800">{{ jobs|length }}</strong> Career decisions guided</div>
         {% endif %}
 
-        <div>•</div>
+        {% comment %} <div>•</div>
 
-        <div><strong class="text-slate-800">{{ stats.avg_match_score|default:"—" }}</strong> avg match</div>
+        <div><strong class="text-slate-800">{{ stats.avg_match_score|default:"—" }}</strong> avg match</div> {% endcomment %}
       </div>
     </div>
   </div>
@@ -69,9 +68,9 @@
       <p class="mt-3 text-slate-500 text-sm text-left">
         Get started by uploading your resume. We parse your skills, projects, and experience automatically, setting the foundation for intelligent job matching
       </p>
-      <div class="mt-6 text-center">
+      {% comment %} <div class="mt-6 text-center">
         <p class="inline-block px-4 py-2 rounded-full bg-emerald-600 text-white text-sm shadow-sm">Get Started</p>
-      </div>
+      </div> {% endcomment %}
     </article>
 
     <!-- Card 2 -->
@@ -84,9 +83,9 @@
       <p class="mt-3 text-slate-500 text-sm">
         Paste any job description to get an instant 0-10 match score. See which skills you have, what's missing, and discover transferable skills you can highlight from your experience.
       </p>
-      <div class="mt-6 text-center">
+      {% comment %} <div class="mt-6 text-center">
         <p  class="inline-block px-4 py-2 rounded-full bg-orange-100 text-orange-700 text-sm">Match Against Job</p>
-      </div>
+      </div> {% endcomment %}
     </article>
 
     <!-- Card 3 -->
@@ -99,9 +98,9 @@
       <p class="mt-3 text-slate-500 text-sm">
         Get ONE high-impact recommendation per job: reframe your project descriptions, highlight overlooked skills, or learn what's critical. Plus, ask career questions like 'Am I ready for data science roles?'
       </p>
-      <div class="mt-6 text-center">
+      {% comment %} <div class="mt-6 text-center">
         <p class="inline-block px-4 py-2 rounded-full bg-violet-600 text-white text-sm shadow-sm">Ask AI Assistant</p>
-      </div>
+      </div> {% endcomment %}
     </article>
   </div>
 </section>
@@ -126,7 +125,7 @@
 
         <div class="p-4 rounded-lg border border-slate-100">
           <div class="font-medium text-slate-800">Semantic Match</div>
-          <div class="text-sm text-slate-500 mt-2">Weighted scoring (critical 60%, beneficial 20%, experience 15%, projects 5%) returns a 0–10 score and评级 (Excellent / Strong / Moderate / Weak).</div>
+          <div class="text-sm text-slate-500 mt-2">Weighted scoring (critical 60%, beneficial 20%, experience 15%, projects 5%) returns a 0–10 score and status (Excellent / Strong / Moderate / Weak).</div>
         </div>
 
         <div class="p-4 rounded-lg border border-slate-100">
@@ -149,17 +148,19 @@
     <aside class="bg-white rounded-2xl p-6 shadow-lg">
       <div class="flex items-center justify-between">
         <div>
-          <div class="text-xs text-slate-500">Live result</div>
-          <div class="text-2xl font-semibold text-slate-900 mt-1">{{ stats.avg_match_score|default:"—" }}</div>
-          <div class="text-sm text-slate-500">Average match</div>
+          <div class="text-xs text-slate-500">Your Career Readiness</div>
+          <div class="text-2xl font-semibold text-slate-900 mt-1">
+            {{ stats.avg_match_score|default:"—" }}
+          </div>
+          <div class="text-sm text-slate-500">Average Match Score</div>
         </div>
         <div class="w-36">
           <canvas id="resultDonut" data-skills='{{ skill_counts|default:"[]"|safe }}' height="120"></canvas>
         </div>
       </div>
-
+    
       <div class="mt-6 text-sm text-slate-600">
-        <div class="font-medium">Recent outcomes</div>
+        <div class="font-medium">Recent Analyses</div>
         <ul class="mt-3 space-y-2">
           {% for m in recent_matches %}
             <li class="flex items-center justify-between">
@@ -167,13 +168,15 @@
               <div class="text-sm font-semibold">{{ m.score }}</div>
             </li>
           {% empty %}
-            <li class="text-slate-400">No recent matches — run one now.</li>
+            <li class="text-slate-400">No recent analyses — start one now.</li>
           {% endfor %}
         </ul>
       </div>
-
+    
       <div class="mt-6">
-        <a href="{% url 'nl_query' %}" class="block text-center px-4 py-2 rounded-full bg-indigo-600 text-white">Try readiness check</a>
+        <a href="{% url 'analyze_job_fit' %}" class="block text-center px-4 py-2 rounded-full bg-indigo-600 text-white hover:bg-indigo-700">
+          Start Readiness Check
+        </a>
       </div>
     </aside>
   </div>
@@ -202,14 +205,14 @@
 
 <!-- FOOT CTA -->
 <section class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 mb-16">
-  <div class="bg-white rounded-2xl p-8 flex flex-col md:flex-row items-center justify-between gap-6 shadow-lg">
+  <div class="bg-white rounded-2xl p-8 flex flex-col md:flex-row items-center justify-between gap-6 shadow-lg transition">
     <div>
-      <h4 class="text-2xl font-semibold text-slate-900">Ready to tailor your resume?</h4>
-      <p class="text-sm text-slate-600 mt-2">Upload a resume and a job description — get a prioritized change you can apply immediately.</p>
+      <h4 class="text-2xl font-semibold text-slate-900">Ready to advance your career?</h4>
+      <p class="text-sm text-slate-600 mt-2">Ask career-related questions or analyze job descriptions to discover your next steps.</p>
     </div>
     <div class="flex gap-3">
-      <a href="{% url 'upload_resume' %}" class="px-5 py-3 rounded-full bg-cyan-500 text-white shadow">Upload Resume</a>
-      <a href="{% url 'upload_job' %}" class="px-5 py-3 rounded-full bg-white border border-slate-200 text-slate-700">Upload Job</a>
+      <a href="{% url 'nl_query' %}" class="px-5 py-3 rounded-full bg-cyan-500 text-white shadow hover:bg-cyan-600 transition-colors duration-300">Ask Questions</a>
+      <a href="{% url 'analyze_job_fit' %}" class="px-5 py-3 rounded-full bg-white border border-slate-200 text-slate-700 hover:bg-slate-100 transition-colors duration-300">Analyze Job Fit</a>
     </div>
   </div>
 </section>

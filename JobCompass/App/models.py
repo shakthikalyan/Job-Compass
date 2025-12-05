@@ -9,8 +9,10 @@ User = get_user_model()
 class Skill(models.Model):
     name = models.CharField(max_length=120, unique=True)
     normalized = models.CharField(max_length=120, blank=True, help_text="Normalized form (e.g., React.js -> React)")
-    def __str__(self):
-        return self.name
+    esco_id = models.CharField(max_length=80, blank=True, null=True, help_text="Optional ESCO id")
+    synonyms = jsonfield.JSONField(blank=True, default=list)
+    embedding = models.BinaryField(blank=True, null=True, help_text="Optional precomputed embedding (store as bytes)")  # optional
+    source = models.CharField(max_length=50, blank=True, default="local")
 
 class Resume(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)

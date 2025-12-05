@@ -35,20 +35,15 @@
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5" d="M12 4v16m8-8H4"/>
               </svg>
             </div>
-            <div class="text-lg font-semibold tracking-tight text-slate-900">Career Compass</div>
+            <div class="text-2xl font-semibold tracking-normal text-slate-900">Career Compass</div>
           </a>
         </div>
 
-        <nav class="hidden md:flex items-center gap-4">
-          <a href="{% url 'upload_resume' %}" class="px-3 py-2 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-100">Upload Resume</a>
-          <a href="{% url 'upload_job' %}" class="px-3 py-2 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-100">Upload Job</a>
-          <a href="{% url 'nl_query' %}" class="px-3 py-2 rounded-md text-sm font-medium text-slate-700 hover:bg-slate-100">Ask Questions</a>
-        </nav>
-
+      
         <div class="flex items-center gap-3">
           <a href="{% url 'admin:index' %}" class="text-sm text-slate-600 hover:underline hidden sm:inline">Admin</a>
           <button class="p-2 rounded-md hover:bg-slate-100" aria-label="Profile">
-            <div class="w-8 h-8 rounded-full bg-slate-200 flex items-center justify-center text-slate-600">S</div>
+            <div class="w-10 h-8 rounded-full bg-slate-200 flex items-center justify-center text-slate-600">User</div>
           </button>
         </div>
       </div>
@@ -74,12 +69,6 @@
     {% block content %}{% endblock %}
   </main>
 
-  {% comment %} <footer class="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6 text-sm text-slate-500">
-    <div class="flex flex-col md:flex-row items-center justify-between gap-3">
-      <div>© {{ now.year }} Career Compass • Built with ♥</div>
-      
-    </div>
-  </footer> {% endcomment %}
 
 </body>
 </html>

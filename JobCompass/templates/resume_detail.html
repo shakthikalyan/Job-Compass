@@ -9,16 +9,16 @@
           <h2 class="text-xl font-semibold">Resume • {{ resume.id }}</h2>
           <div class="text-sm text-slate-500">Uploaded: {{ resume.uploaded_at }}</div>
         </div>
-        <div class="text-sm text-slate-500">
+        {% comment %} <div class="text-sm text-slate-500">
           <a class="px-3 py-1 bg-slate-50 rounded text-slate-700 hover:underline" href="{% url 'admin:core_resume_change' resume.id %}">Edit</a>
-        </div>
+        </div> {% endcomment %}
       </div>
 
       <div class="mt-6 grid grid-cols-1 md:grid-cols-3 gap-4">
         <div class="p-4 rounded-lg bg-slate-50">
           <div class="text-xs text-slate-500">Technical Skills</div>
           <div class="mt-2 flex flex-wrap gap-2">
-            {% for s in resume.parsed.technical_skills|default:[] %}
+            {% for s in resume.parsed.technical_skills %}
               <span class="px-2 py-1 bg-indigo-100 text-indigo-700 rounded text-xs">{{ s }}</span>
             {% empty %}
               <div class="text-sm text-slate-400">No technical skills parsed</div>
@@ -28,7 +28,7 @@
         <div class="p-4 rounded-lg bg-slate-50">
           <div class="text-xs text-slate-500">Soft Skills</div>
           <div class="mt-2 flex flex-wrap gap-2">
-            {% for s in resume.parsed.soft_skills|default:[] %}
+            {% for s in resume.parsed.soft_skills %}
               <span class="px-2 py-1 bg-emerald-100 text-emerald-700 rounded text-xs">{{ s }}</span>
             {% empty %}
               <div class="text-sm text-slate-400">No soft skills parsed</div>
@@ -38,7 +38,7 @@
         <div class="p-4 rounded-lg bg-slate-50">
           <div class="text-xs text-slate-500">Certifications</div>
           <div class="mt-2">
-            {% for c in resume.parsed.certifications|default:[] %}
+            {% for c in resume.parsed.certifications %}
               <div class="text-sm text-slate-700">{{ c }}</div>
             {% empty %}
               <div class="text-sm text-slate-400">None parsed</div>
@@ -50,7 +50,7 @@
       <div class="mt-6">
         <h4 class="font-medium text-slate-800">Projects</h4>
         <div class="mt-3 space-y-3">
-          {% for p in resume.parsed.projects|default:[] %}
+          {% for p in resume.parsed.projects %}
             <div class="p-4 bg-slate-50 rounded-lg">
               <div class="flex items-start justify-between">
                 <div>
@@ -60,7 +60,7 @@
                 <div class="text-right">
                   <div class="text-xs text-slate-500">Tech</div>
                   <div class="text-sm mt-1">
-                    {% for t in p.technologies|default:[] %}
+                    {% for t in p.technologies %}
                       <span class="px-2 py-1 bg-indigo-50 text-indigo-700 rounded text-xs">{{ t }}</span>
                     {% endfor %}
                   </div>
@@ -97,7 +97,8 @@
         <script>
           document.getElementById('matchBtn').addEventListener('click', function(){
             const jid = document.getElementById('jobIdInput').value.trim();
-            if (!jid) { alert('Paste job id to match'); return; }
+            if (!jid) {
+              console.error("Job ID is not valid"); alert('Paste job id to match'); return; }
             window.location.href = "{% url 'compute_match' resume.id 'JOBID' %}".replace('JOBID', jid);
           });
         </script>

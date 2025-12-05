@@ -14,21 +14,45 @@ from collections import defaultdict
 from django.conf import settings
 import json
 import math
+import PyPDF2
+from sentence_transformers import SentenceTransformer, util
+import numpy as np
+import os
+from django.db.models import Q
 
 # ---------- Helpers ----------
+
+
 def simple_text_from_file(file_obj):
     """
-    Minimal text extractor: if PDF you'd normally use pdfminer / tika; here we read bytes and attempt utf-8.
-    In production, swap with robust extractor.
+    Extract text from PDF files properly using PyPDF2
     """
     try:
+        # Check if it's a PDF
+        if hasattr(file_obj, 'name') and file_obj.name.lower().endswith('.pdf'):
+            pdf_reader = PyPDF2.PdfReader(file_obj)
+            text = ""
+            for page in pdf_reader.pages:
+                text += page.extract_text()
+            # Clean any remaining NUL bytes
+            text = text.replace('\x00', '')
+            return text
+        else:
+            # For non-PDF files (like .txt)
+            b = file_obj.read()
+            text = b.decode('utf-8', errors='ignore')
+            text = text.replace('\x00', '')
+            return text
+    except Exception as e:
+        # Fallback for any errors
+        file_obj.seek(0)
         b = file_obj.read()
-        try:
-            return b.decode('utf-8', errors='ignore')
-        except Exception:
-            return str(b)
+        text = str(b, errors='ignore')
+        text = text.replace('\x00', '')
+        return text
     finally:
         file_obj.seek(0)
+
 
 # ---------- 1. Resume Parsing Logic ----------
 def build_resume_prompt(raw_text):
@@ -150,7 +174,10 @@ def parse_and_store_job(job_obj):
 # critical skills 60%, beneficial 20%, experience 15%, projects 5%
 # scoring scale 0-10. We'll produce breakdown.
 
-# normalization map / equivalences
+# ----- KB-aware equivalence helpers -----
+from django.db.models import Q
+
+# local fallback equivalences (keep for dev/no-kb fallback)
 EQUIVALENCES = {
     "docker": ["containerization", "containers"],
     "react": ["react.js", "reactjs"],
@@ -161,27 +188,103 @@ EQUIVALENCES = {
     "postgresql": ["postgres"]
 }
 
+# import Skill model here (adjust path to your app)
+try:
+    from App.models import Skill
+except Exception:
+    Skill = None
+
 def normalize_token(tok):
-    t = tok.lower().strip()
+    t = (tok or "").lower().strip()
     if t.endswith('s'):
         t = t[:-1]
     return t
 
+def kb_lookup(token):
+    """
+    Look up `token` in the Skill KB.
+    Returns:
+      - skill_obj: Skill instance if found, else None
+      - canonical_name: normalized canonical name (string) if found else None
+      - matched_synonyms: list of matching synonyms from the KB for this token
+    """
+    if Skill is None:
+        return None, None, []
+    t = normalize_token(token)
+    # try direct normalized match
+    skill = Skill.objects.filter(Q(normalized=t) | Q(name__iexact=token)).first()
+    if skill:
+        # compute matched synonyms
+        match_syns = []
+        try:
+            syns = skill.synonyms or []
+            for s in syns:
+                if normalize_token(s) == t or t in normalize_token(s) or normalize_token(s) in t:
+                    match_syns.append(s)
+        except Exception:
+            syns = []
+            match_syns = []
+        return skill, skill.name, match_syns
+
+    # try searching synonyms across table (simple filter using contains; adapt to your DB)
+    # Note: JSONField contains lookup differs by DB; the following may work with Django JSONField on Postgres:
+    try:
+        skill = Skill.objects.filter(synonyms__icontains=[token]).first()
+        if skill:
+            return skill, skill.name, [token]
+    except Exception:
+        # fallback linear scan (less efficient but safe)
+        for skill in Skill.objects.all()[:10000]:
+            syns = skill.synonyms or []
+            for s in syns:
+                if normalize_token(s) == t or t in normalize_token(s) or normalize_token(s) in t:
+                    return skill, skill.name, [s]
+    return None, None, []
+
 def is_equivalent(skill, candidate_skills):
-    s = normalize_token(skill)
-    cand = [normalize_token(c) for c in candidate_skills]
-    if s in cand:
-        return True, 1.0  # exact
-    for k,v in EQUIVALENCES.items():
-        if s==k:
-            for alt in v:
-                if alt in cand:
+    """
+    KB-aware equivalence check.
+    Returns (matched: bool, score: float)
+    Score: 1.0 exact match, 0.8 KB-synonym match, 0.5 transferable (substring), 0.0 none.
+    Priority: KB exact -> KB synonym -> local EQUIVALENCES -> substring fallback.
+    """
+    s_norm = normalize_token(skill)
+    cand_norms = [normalize_token(c) for c in candidate_skills if c]
+
+    # 1) KB lookup for the skill token
+    kb_skill_obj, canonical_name, matched_syns = kb_lookup(skill)
+    if kb_skill_obj:
+        # Build canonical forms to check against candidate_skills (include synonyms)
+        kb_variants = set([normalize_token(canonical_name)])
+        try:
+            for syn in (kb_skill_obj.synonyms or []):
+                kb_variants.add(normalize_token(syn))
+        except Exception:
+            pass
+        # check candidate skills for any of these variants
+        for c in cand_norms:
+            if c in kb_variants:
+                return True, 1.0  # exact via KB
+        # check if candidate contains any synonyms (looser)
+        for c in cand_norms:
+            for v in kb_variants:
+                if v in c or c in v:
+                    return True, 0.8  # KB-synonym partial
+        # no match found in candidate_skills
+    # 2) local EQUIVALENCES (fallback)
+    # Check canonical key -> alt labels
+    for key, alts in EQUIVALENCES.items():
+        if s_norm == normalize_token(key):
+            # does candidate contain any alt?
+            for alt in alts:
+                if normalize_token(alt) in cand_norms:
                     return True, 1.0
-    # check transferable (substring)
-    for c in cand:
-        if s in c or c in s:
+    # 3) substring transferable fallback (existing logic)
+    for c in cand_norms:
+        if s_norm in c or c in s_norm:
             return True, 0.5
     return False, 0.0
+
 
 def semantic_match_score(resume_parsed, job_parsed):
     # Compute points then scale to 0-10
@@ -422,3 +525,31 @@ def handle_nl_query(session_parsed_resume, session_parsed_job, last_turns, query
         return {"intent":"application_advice", "answer": f"Confidence rating {mm['rating']} with score {mm['score']}. Breakdown: {mm['breakdown']}"}
     # fallback
     return {"intent":"unknown", "answer":"I can (1) give a skill roadmap, (2) readiness check, (3) specific skill relevance. Try: 'Am I ready for this job?' or 'What skills for data science?'"}
+
+
+
+EMBEDDING_MODEL_NAME = os.getenv("SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2")
+EMBEDDING_MODEL = None
+try:
+    EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
+except Exception as e:
+    # If model load fails (dev machine without model), set to None and fall back to rule-based methods
+    EMBEDDING_MODEL = None
+
+def embed_texts(texts):
+    """
+    Returns numpy array of embeddings for given list of texts.
+    Falls back to empty list if model not available.
+    """
+    if not EMBEDDING_MODEL:
+        return None
+    if not texts:
+        return np.zeros((0, EMBEDDING_MODEL.get_sentence_embedding_dimension()))
+    emb = EMBEDDING_MODEL.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+    return emb
+
+def cosine_sim(a, b):
+    """Compute pairwise cosine similarity between arrays a (n,d) and b (m,d) -> (n,m)"""
+    if a is None or b is None or len(a)==0 or len(b)==0:
+        return np.zeros((0,0))
+    return util.cos_sim(a, b).cpu().numpy()  # util.cos_sim returns torch tensor

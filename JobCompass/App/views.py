@@ -110,3 +110,91 @@ def nl_query(request):
     else:
         form = NLQueryForm()
     return render(request, "nl_query.html", {"form": form})
+
+
+
+def analyze_job_fit(request):
+    """
+    Unified workflow: Upload resume + job → Get match score, gaps, and recommendation all at once
+    """
+    if request.method == "POST":
+        # Handle resume (file or text)
+        if 'resume_file' in request.FILES:
+            resume_file = request.FILES['resume_file']
+            resume = Resume.objects.create(file=resume_file)
+            utils.parse_and_store_resume(resume)
+        elif 'resume_text' in request.POST and request.POST['resume_text'].strip():
+            resume_text = request.POST['resume_text']
+            resume = Resume.objects.create(raw_text=resume_text)
+            prompt = utils.build_resume_prompt(resume_text)
+            resume.parsed = utils.call_claude_parse(prompt)
+            resume.save()
+        else:
+            return render(request, "analyze.html", {"error": "Please provide a resume"})
+        
+        # Handle job description (file or text)
+        if 'job_file' in request.FILES:
+            job_file = request.FILES['job_file']
+            job = JobDescription.objects.create(file=job_file)
+            utils.parse_and_store_job(job)
+        elif 'job_text' in request.POST and request.POST['job_text'].strip():
+            job_text = request.POST['job_text']
+            job = JobDescription.objects.create(raw_text=job_text)
+            job.parsed = utils.parse_job_description_text(job_text)
+            job.title = job.parsed.get('title', 'Job')
+            job.save()
+        else:
+            return render(request, "analyze.html", {"error": "Please provide a job description"})
+        
+        # STEP 3: Compute match score
+        match_result = utils.semantic_match_score(resume.parsed or {}, job.parsed or {})
+        
+        # STEP 4: Perform gap analysis
+        gaps = utils.gap_analysis(resume.parsed or {}, job.parsed or {}, top_n=5)
+        
+        # STEP 5: Generate personalized recommendation
+        recommendation = utils.generate_personalized_recommendation(
+            resume.parsed or {}, 
+            job.parsed or {}, 
+            gaps
+        )
+        
+        # Save everything to database
+        match = MatchResult.objects.create(
+            resume=resume,
+            job=job,
+            score=match_result['score'],
+            rating=match_result['rating'],
+            breakdown=match_result['breakdown']
+        )
+        
+        # Save gaps
+        for g in gaps:
+            Gap.objects.create(
+                match=match,
+                skill=g['skill'],
+                type=g['type'],
+                importance=g['importance'],
+                suggestion=g['suggestion']
+            )
+        
+        # Save recommendation
+        Recommendation.objects.create(
+            match=match,
+            kind=recommendation['kind'],
+            text=recommendation['text']
+        )
+        
+        # Render unified results page
+        context = {
+            'match': match,
+            'match_result': match_result,
+            'gaps': gaps,
+            'recommendation': recommendation,
+            'resume': resume,
+            'job': job
+        }
+        return render(request, "analysis_result.html", context)
+    
+    # GET request - show upload form
+    return render(request, "analyze.html")
