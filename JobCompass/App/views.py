@@ -1,3 +1,4 @@
+# App/views.py
 from django.shortcuts import render, redirect, get_object_or_404
 from .forms import ResumeUploadForm, JobUploadForm, NLQueryForm
 from .models import Resume, JobDescription, MatchResult, Gap, Recommendation, NLSession
@@ -5,35 +6,22 @@ from . import utils
 from django.views.decorators.csrf import csrf_exempt
 from django.db.models import Avg
 
-# def index(request):
-#     resumes = Resume.objects.all().order_by('-uploaded_at')[:10]
-#     jobs = JobDescription.objects.all().order_by('-uploaded_at')[:10]
-#     return render(request, "base.html", {"resumes": resumes, "jobs": jobs})
-
 def index(request):
     resumes = Resume.objects.all().order_by('-uploaded_at')[:10]
     jobs = JobDescription.objects.all().order_by('-uploaded_at')[:10]
-
-    # Compute safe stats in Python
     total_resumes = Resume.objects.count()
     total_jobs = JobDescription.objects.count()
     avg_match = MatchResult.objects.aggregate(avg=Avg('score'))['avg'] or 0.0
-
     stats = {
         "total_resumes": total_resumes,
         "total_jobs": total_jobs,
         "avg_match_score": round(avg_match, 2)
     }
-
-    # Example skill_counts & recent_matches (fill as you like)
-    skill_counts = []  # build from parsed resumes if desired
     recent_matches = MatchResult.objects.order_by('-computed_at')[:5]
-
     return render(request, "index.html", {
         "resumes": resumes,
         "jobs": jobs,
         "stats": stats,
-        "skill_counts": skill_counts,
         "recent_matches": recent_matches
     })
 
@@ -43,7 +31,7 @@ def upload_resume(request):
         if form.is_valid():
             r = form.save()
             utils.parse_and_store_resume(r)
-            return redirect(f'/resume/{r.id}/')  # project-level URLs
+            return redirect('resume_detail', resume_id=r.id)
     else:
         form = ResumeUploadForm()
     return render(request, "upload_resume.html", {"form": form})
@@ -58,7 +46,7 @@ def upload_job(request):
         if form.is_valid():
             j = form.save()
             utils.parse_and_store_job(j)
-            return redirect(f'/job/{j.id}/')
+            return redirect('job_detail', job_id=j.id)
     else:
         form = JobUploadForm()
     return render(request, "upload_job.html", {"form": form})
@@ -111,33 +99,30 @@ def nl_query(request):
         form = NLQueryForm()
     return render(request, "nl_query.html", {"form": form})
 
-
-
 def analyze_job_fit(request):
     """
-    Unified workflow: Upload resume + job → Get match score, gaps, and recommendation all at once
+    Unified: upload resume + JD -> compute match, gaps, recommendation and save results.
     """
     if request.method == "POST":
-        # Handle resume (file or text)
+        # Resume
         if 'resume_file' in request.FILES:
             resume_file = request.FILES['resume_file']
             resume = Resume.objects.create(file=resume_file)
             utils.parse_and_store_resume(resume)
-        elif 'resume_text' in request.POST and request.POST['resume_text'].strip():
+        elif request.POST.get('resume_text', '').strip():
             resume_text = request.POST['resume_text']
             resume = Resume.objects.create(raw_text=resume_text)
-            prompt = utils.build_resume_prompt(resume_text)
-            resume.parsed = utils.call_claude_parse(prompt)
+            resume.parsed = utils.call_claude_parse(utils.build_resume_prompt(resume_text))
             resume.save()
         else:
             return render(request, "analyze.html", {"error": "Please provide a resume"})
-        
-        # Handle job description (file or text)
+
+        # Job
         if 'job_file' in request.FILES:
             job_file = request.FILES['job_file']
             job = JobDescription.objects.create(file=job_file)
             utils.parse_and_store_job(job)
-        elif 'job_text' in request.POST and request.POST['job_text'].strip():
+        elif request.POST.get('job_text', '').strip():
             job_text = request.POST['job_text']
             job = JobDescription.objects.create(raw_text=job_text)
             job.parsed = utils.parse_job_description_text(job_text)
@@ -145,21 +130,12 @@ def analyze_job_fit(request):
             job.save()
         else:
             return render(request, "analyze.html", {"error": "Please provide a job description"})
-        
-        # STEP 3: Compute match score
+
+        # Compute and save results
         match_result = utils.semantic_match_score(resume.parsed or {}, job.parsed or {})
-        
-        # STEP 4: Perform gap analysis
         gaps = utils.gap_analysis(resume.parsed or {}, job.parsed or {}, top_n=5)
-        
-        # STEP 5: Generate personalized recommendation
-        recommendation = utils.generate_personalized_recommendation(
-            resume.parsed or {}, 
-            job.parsed or {}, 
-            gaps
-        )
-        
-        # Save everything to database
+        recommendation = utils.generate_personalized_recommendation(resume.parsed or {}, job.parsed or {}, gaps)
+
         match = MatchResult.objects.create(
             resume=resume,
             job=job,
@@ -167,25 +143,10 @@ def analyze_job_fit(request):
             rating=match_result['rating'],
             breakdown=match_result['breakdown']
         )
-        
-        # Save gaps
         for g in gaps:
-            Gap.objects.create(
-                match=match,
-                skill=g['skill'],
-                type=g['type'],
-                importance=g['importance'],
-                suggestion=g['suggestion']
-            )
-        
-        # Save recommendation
-        Recommendation.objects.create(
-            match=match,
-            kind=recommendation['kind'],
-            text=recommendation['text']
-        )
-        
-        # Render unified results page
+            Gap.objects.create(match=match, skill=g['skill'], type=g['type'], importance=g['importance'], suggestion=g['suggestion'])
+        Recommendation.objects.create(match=match, kind=recommendation['kind'], text=recommendation['text'])
+
         context = {
             'match': match,
             'match_result': match_result,
@@ -195,6 +156,42 @@ def analyze_job_fit(request):
             'job': job
         }
         return render(request, "analysis_result.html", context)
-    
-    # GET request - show upload form
+
+    return render(request, "analyze.html")
+
+
+@csrf_exempt
+def analyze_and_show_resume(request):
+    """
+    Accepts a POST from the Analyze form (resume_file or resume_text).
+    Parses and saves the resume using utils.parse_and_store_resume (same pipeline),
+    then redirects to the resume_detail page to show resume_detail.html.
+
+    Usage: POST same form fields as analyze.html:
+      - resume_file (file) OR resume_text (text)
+    """
+    if request.method == "POST":
+        # Resume by file
+        if 'resume_file' in request.FILES:
+            resume_file = request.FILES['resume_file']
+            # create Resume record with uploaded file (reusing app's model)
+            r = Resume.objects.create(file=resume_file)
+            # parse and persist parsed JSON into r.parsed
+            utils.parse_and_store_resume(r)
+
+            # redirect to resume detail page to view parsed results
+            return redirect('resume_detail', resume_id=r.id)
+
+        # Resume by pasted text
+        if request.POST.get('resume_text', '').strip():
+            resume_text = request.POST['resume_text']
+            r = Resume.objects.create(raw_text=resume_text)
+            # use the same lightweight parser used elsewhere in the app
+            r.parsed = utils.call_claude_parse(utils.build_resume_prompt(resume_text))
+            r.save()
+            return redirect('resume_detail', resume_id=r.id)
+
+        # If no resume provided, re-render analyze form with an error (keeps original UI)
+        return render(request, "analyze.html", {"error": "Please provide a resume (file or text)."})
+    # If GET, simply show the analyze page (same as existing view)
     return render(request, "analyze.html")
