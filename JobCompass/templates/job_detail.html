@@ -1,4 +1,3 @@
-
 {% extends "base.html" %}
 {% block content %}
 <div class="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-3 gap-6">
@@ -8,30 +7,42 @@
         <h2 class="text-xl font-semibold">{{ job.title|default:"Job" }}</h2>
         <div class="text-sm text-slate-500">Uploaded: {{ job.uploaded_at }}</div>
       </div>
-      <div class="text-sm text-slate-500">
-        <a class="px-3 py-1 bg-slate-50 rounded text-slate-700" href="{% url 'admin:core_jobdescription_change' job.id %}">Edit</a>
-      </div>
+        <div class="text-sm text-slate-500">
+          {% if admin_change_url %}
+            <a class="px-3 py-1 bg-slate-50 rounded text-slate-700" href="{{ admin_change_url }}">Edit</a>
+          {% endif %}
+        </div>
     </div>
 
     <div class="mt-6 grid grid-cols-1 md:grid-cols-2 gap-4">
       <div class="p-4 rounded-lg bg-slate-50">
         <div class="text-xs text-slate-500">Critical Skills</div>
         <div class="mt-2 flex flex-wrap gap-2">
-          {% for s in job.parsed.critical_skills|default:[] %}
-            <span class="px-2 py-1 bg-red-100 text-red-700 rounded text-xs">{{ s }}</span>
-          {% empty %}
-            <div class="text-sm text-slate-400">No critical skills parsed</div>
-          {% endfor %}
+          {# Safely obtain critical skills; loop and use empty block if no items #}
+          {% with crit=job.parsed.critical_skills|default:"" %}
+            {% if crit %}
+              {% for s in crit %}
+                <span class="px-2 py-1 bg-red-100 text-red-700 rounded text-xs">{{ s }}</span>
+              {% endfor %}
+            {% else %}
+              <div class="text-sm text-slate-400">No critical skills parsed</div>
+            {% endif %}
+          {% endwith %}
         </div>
       </div>
+
       <div class="p-4 rounded-lg bg-slate-50">
         <div class="text-xs text-slate-500">Beneficial Skills</div>
         <div class="mt-2 flex flex-wrap gap-2">
-          {% for s in job.parsed.beneficial_skills|default:[] %}
-            <span class="px-2 py-1 bg-slate-100 text-slate-700 rounded text-xs">{{ s }}</span>
-          {% empty %}
-            <div class="text-sm text-slate-400">No beneficial skills parsed</div>
-          {% endfor %}
+          {% with ben=job.parsed.beneficial_skills|default:"" %}
+            {% if ben %}
+              {% for s in ben %}
+                <span class="px-2 py-1 bg-slate-100 text-slate-700 rounded text-xs">{{ s }}</span>
+              {% endfor %}
+            {% else %}
+              <div class="text-sm text-slate-400">No beneficial skills parsed</div>
+            {% endif %}
+          {% endwith %}
         </div>
       </div>
     </div>
@@ -39,11 +50,15 @@
     <div class="mt-6">
       <h4 class="font-medium">Responsibilities</h4>
       <ul class="mt-3 list-disc pl-6 space-y-2 text-sm text-slate-600">
-        {% for r in job.parsed.responsibilities|default:[] %}
-          <li>{{ r }}</li>
-        {% empty %}
-          <li class="text-slate-400">No responsibilities parsed</li>
-        {% endfor %}
+        {% with resps=job.parsed.responsibilities|default:"" %}
+          {% if resps %}
+            {% for r in resps %}
+              <li>{{ r }}</li>
+            {% endfor %}
+          {% else %}
+              <li class="text-slate-400">No responsibilities parsed</li>
+          {% endif %}
+        {% endwith %}
       </ul>
     </div>
 
@@ -60,18 +75,23 @@
         <input id="resumeIdInput" placeholder="Paste resume id..." class="w-full px-3 py-2 border rounded" />
         <a id="matchBtn" class="block text-center px-3 py-2 bg-indigo-600 text-white rounded">Match</a>
       </div>
-      <script>
+      {% comment %} <script>
         document.getElementById('matchBtn').addEventListener('click', function(){
           const rid = document.getElementById('resumeIdInput').value.trim();
           if (!rid) { alert('Paste resume id to match'); return; }
           window.location.href = "{% url 'compute_match' 'RESUMEID' job.id %}".replace('RESUMEID', rid);
         });
-      </script>
+      </script> {% endcomment %}
     </div>
 
     <div class="bg-white rounded-xl p-5 shadow">
       <h4 class="font-semibold">Summary</h4>
-      <p class="text-sm text-slate-500 mt-2">This job has {{ job.parsed.critical_skills|length|default:0 }} critical skills and {{ job.parsed.beneficial_skills|length|default:0 }} beneficial skills parsed.</p>
+      {# Use quoted fallback for default when printing length #}
+      <p class="text-sm text-slate-500 mt-2">
+        This job has
+        {{ job.parsed.critical_skills|length|default:"0" }} critical skills and
+        {{ job.parsed.beneficial_skills|length|default:"0" }} beneficial skills parsed.
+      </p>
     </div>
   </aside>
 </div>

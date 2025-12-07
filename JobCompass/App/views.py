@@ -5,6 +5,10 @@ from .models import Resume, JobDescription, MatchResult, Gap, Recommendation, NL
 from . import utils
 from django.views.decorators.csrf import csrf_exempt
 from django.db.models import Avg
+from django.utils import timezone
+from django.http import JsonResponse, HttpResponseBadRequest
+from django.urls import reverse, NoReverseMatch
+import json
 
 def index(request):
     resumes = Resume.objects.all().order_by('-uploaded_at')[:10]
@@ -25,35 +29,14 @@ def index(request):
         "recent_matches": recent_matches
     })
 
-def upload_resume(request):
-    if request.method == "POST":
-        form = ResumeUploadForm(request.POST, request.FILES)
-        if form.is_valid():
-            r = form.save()
-            utils.parse_and_store_resume(r)
-            return redirect('resume_detail', resume_id=r.id)
-    else:
-        form = ResumeUploadForm()
-    return render(request, "upload_resume.html", {"form": form})
+
 
 def resume_detail(request, resume_id):
     r = get_object_or_404(Resume, pk=resume_id)
     return render(request, "resume_detail.html", {"resume": r})
 
-def upload_job(request):
-    if request.method == "POST":
-        form = JobUploadForm(request.POST, request.FILES)
-        if form.is_valid():
-            j = form.save()
-            utils.parse_and_store_job(j)
-            return redirect('job_detail', job_id=j.id)
-    else:
-        form = JobUploadForm()
-    return render(request, "upload_job.html", {"form": form})
 
-def job_detail(request, job_id):
-    j = get_object_or_404(JobDescription, pk=job_id)
-    return render(request, "job_detail.html", {"job": j})
+
 
 def compute_match(request, resume_id, job_id):
     resume = get_object_or_404(Resume, pk=resume_id)
@@ -195,3 +178,116 @@ def analyze_and_show_resume(request):
         return render(request, "analyze.html", {"error": "Please provide a resume (file or text)."})
     # If GET, simply show the analyze page (same as existing view)
     return render(request, "analyze.html")
+
+
+@csrf_exempt
+def analyze_and_show_job(request):
+    """
+    Accepts POST with job_file OR job_text, parse+persist using utils,
+    then redirect to job_detail.
+    """
+    if request.method == "POST":
+        # file upload
+        if 'job_file' in request.FILES:
+            job_file = request.FILES['job_file']
+            j = JobDescription.objects.create(file=job_file, uploaded_at=timezone.now())
+            # try robust parse_and_store_job (reads file if needed)
+            try:
+                utils.parse_and_store_job(j)
+            except Exception as e:
+                # fallback: simple parse from extracted text
+                try:
+                    txt = utils.simple_text_from_file(job_file) or ""
+                    parsed = utils.parse_job_description_text(txt)
+                    j.parsed = parsed
+                    j.title = parsed.get('title', j.title or 'Job')
+                    j.save()
+                except Exception:
+                    j.parsed = {"error": f"parsing failed: {str(e)}"}
+                    j.save()
+            return redirect('job_detail', job_id=j.id)
+
+        # pasted text
+        job_text = request.POST.get('job_text', '').strip()
+        if job_text:
+            j = JobDescription.objects.create(raw_text=job_text, uploaded_at=timezone.now())
+            try:
+                parsed = utils.parse_job_description_text(job_text)
+                j.parsed = parsed
+                j.title = parsed.get('title', j.title or (job_text.splitlines()[0] if job_text.splitlines() else "Job"))
+                j.save()
+            except Exception as e:
+                j.parsed = {"error": f"parsing failed: {str(e)}"}
+                j.save()
+            return redirect('job_detail', job_id=j.id)
+
+        # nothing provided
+        return render(request, "analyze.html", {"error": "Please provide a job description (file or text)."})
+    return render(request, "analyze.html")
+
+
+def job_detail(request, job_id):
+    """
+    Show job detail page. Ensure job.parsed is a dict and compute admin_change_url safely.
+    """
+    job = get_object_or_404(JobDescription, pk=job_id)
+
+    # Ensure parsed is a Python dict (sometimes saved as JSON string)
+    if isinstance(job.parsed, str):
+        try:
+            job.parsed = json.loads(job.parsed)
+        except Exception:
+            # not JSON, wrap as text
+            job.parsed = {"raw": job.parsed}
+
+    # ensure parsed has required keys (avoid template errors)
+    if not isinstance(job.parsed, dict):
+        job.parsed = {}
+
+    # compute admin change url safely
+    admin_change_url = None
+    try:
+        name = f'admin:{job._meta.app_label}_{job._meta.model_name}_change'
+        admin_change_url = reverse(name, args=[job.pk])
+    except NoReverseMatch:
+        admin_change_url = None
+
+    context = {
+        "job": job,
+        "admin_change_url": admin_change_url
+    }
+    return render(request, "job_detail.html", context)
+
+
+def analyze_job_json(request, job_id=None):
+    """
+    Useful debug endpoint:
+      - If job_id provided: return parsed JSON for that job
+      - If POST with job_text or job_file: parse and return JSON directly (no DB save)
+    """
+    if request.method == "GET":
+        if not job_id:
+            return HttpResponseBadRequest("Provide job_id as URL parameter or POST job_text/job_file.")
+        job = get_object_or_404(JobDescription, pk=job_id)
+        parsed = job.parsed
+        # normalize if string
+        if isinstance(parsed, str):
+            try:
+                parsed = json.loads(parsed)
+            except Exception:
+                parsed = {"raw": parsed}
+        return JsonResponse({"job_id": str(job.pk), "parsed": parsed}, json_dumps_params={"indent": 2})
+
+    # POST: parse provided job_text or job_file but do not save
+    if request.method == "POST":
+        if 'job_file' in request.FILES:
+            txt = utils.simple_text_from_file(request.FILES['job_file']) or ""
+            parsed = utils.parse_job_description_text(txt)
+            return JsonResponse({"parsed": parsed}, json_dumps_params={"indent": 2})
+        job_text = request.POST.get('job_text', '').strip()
+        if job_text:
+            parsed = utils.parse_job_description_text(job_text)
+            return JsonResponse({"parsed": parsed}, json_dumps_params={"indent": 2})
+        return HttpResponseBadRequest("Provide job_text or job_file in POST.")
+    
+
