@@ -1,10 +1,10 @@
-# App/utils.py
 import re
 import os
 import numpy as np
 from django.db.models import Q
 from django.conf import settings
 import logging
+import time
 
 log = logging.getLogger(__name__)
 
@@ -49,22 +49,14 @@ SECTION_HEADINGS = [
     r'(?i)volunteer', r'(?i)awards', r'(?i)summary', r'(?i)profile', r'(?i)contact'
 ]
 
-
-# ---------- basic helpers ----------
+# ---------- small helpers ----------
 def simple_text_from_file(file_obj):
-    """
-    Improved text extraction:
-    - use pdfplumber when available (better on modern/resume PDFs),
-    - fallback to PyPDF2,
-    - fallback to raw bytes decode.
-    """
     try:
         file_obj.seek(0)
     except Exception:
         pass
 
     text = ""
-    # Try pdfplumber first (better extraction for design PDFs)
     if pdfplumber and hasattr(file_obj, 'name') and file_obj.name.lower().endswith('.pdf'):
         try:
             file_obj.seek(0)
@@ -83,7 +75,6 @@ def simple_text_from_file(file_obj):
         except Exception:
             log.debug("pdfplumber extraction failed", exc_info=True)
 
-    # fallback to PyPDF2 if available
     if hasattr(file_obj, 'name') and file_obj.name.lower().endswith('.pdf') and PyPDF2:
         try:
             file_obj.seek(0)
@@ -101,7 +92,6 @@ def simple_text_from_file(file_obj):
         except Exception:
             log.debug("PyPDF2 extraction failed", exc_info=True)
 
-    # fallback: read bytes and decode
     try:
         file_obj.seek(0)
         raw = file_obj.read()
@@ -114,7 +104,6 @@ def simple_text_from_file(file_obj):
         text = ""
     return text
 
-
 def normalize_token(tok):
     t = (tok or "").lower().strip()
     if t.endswith('s'):
@@ -124,10 +113,6 @@ def normalize_token(tok):
 
 # ---------- KB helpers (Skill table) ----------
 def kb_lookup(token):
-    """
-    Return Skill object, canonical name, and matched synonyms if any.
-    Returns (None, None, []) if not found or DB unavailable.
-    """
     if Skill is None:
         return None, None, []
     t = normalize_token(token)
@@ -136,13 +121,11 @@ def kb_lookup(token):
         syns = skill.synonyms or []
         matched_syns = [s for s in syns if normalize_token(s) == t or t in normalize_token(s) or normalize_token(s) in t]
         return skill, skill.name, matched_syns
-    # Try synonyms contains lookup (best-effort)
     try:
         skill = Skill.objects.filter(synonyms__icontains=[token]).first()
         if skill:
             return skill, skill.name, [token]
     except Exception:
-        # Linear fallback (limited)
         if Skill is not None:
             for s in Skill.objects.all()[:10000]:
                 for syn in s.synonyms or []:
@@ -150,91 +133,155 @@ def kb_lookup(token):
                         return s, s.name, [syn]
     return None, None, []
 
-
-# local fallback equivalences (kept for dev fallback)
 EQUIVALENCES = {
-    "docker": ["containerization", "containers"],
+    "docker": ["containerization", "containers", "containerized"],
     "react": ["react.js", "reactjs"],
     "python": ["py"],
     "flask": ["rest api", "rest"],
-    "aws": ["amazon web services"],
+    "aws": ["amazon web services", "azure", "cloud"],
     "gcp": ["google cloud"],
-    "postgresql": ["postgres"]
+    "postgresql": ["postgres", "postgresql"],
 }
 
+def _extract_keywords_from_phrase(phrase, max_terms=6):
+    if not phrase:
+        return []
+    txt = re.sub(r'[^A-Za-z0-9\+\#\.\s\-]', ' ', phrase)
+    parts = [p.strip().lower() for p in re.split(r'[\s\-]+', txt) if p.strip()]
+    parts = [p for p in parts if p not in _SHORT_STOPWORDS and len(p) > 1]
+    return parts[:max_terms]
+
+# Slightly more permissive thresholds for multi-word tokens
+_JACCARD_HIGH = 0.5
+_JACCARD_MED = 0.25
 
 def is_equivalent(skill, candidate_skills):
-    """
-    KB-aware equivalence check. Returns (matched:bool, score:float)
-    score: 1.0 exact (KB or exact), 0.8 KB-synonym partial, 0.5 transferable substring, 0.0 none.
-    """
-    s_norm = normalize_token(skill)
-    cand = [normalize_token(c) for c in candidate_skills if c]
+    s = (skill or "").strip()
+    if not s:
+        return False, 0.0
+    cand = [c for c in (candidate_skills or []) if c]
+    cand_norm = [normalize_token(c) for c in cand]
 
-    # KB lookup
     kb_skill, canonical, matched_syns = kb_lookup(skill)
     if kb_skill:
         variants = {normalize_token(canonical)}
         for syn in (kb_skill.synonyms or []):
             variants.add(normalize_token(syn))
-        for c in cand:
+        for c in cand_norm:
             if c in variants:
                 return True, 1.0
-        # partial via synonyms
-        for c in cand:
+        for c in cand_norm:
             for v in variants:
                 if v in c or c in v:
-                    return True, 0.8
+                    return True, 0.9
 
-    # local equivalences fallback
+    s_norm = normalize_token(s)
     for key, alts in EQUIVALENCES.items():
         if s_norm == normalize_token(key):
             for alt in alts:
-                if normalize_token(alt) in cand:
-                    return True, 1.0
+                if normalize_token(alt) in cand_norm:
+                    return True, 0.9
 
-    # substring transferable
-    for c in cand:
+    for c in cand_norm:
         if s_norm in c or c in s_norm:
             return True, 0.5
+
+    s_tokens = set(_extract_keywords_from_phrase(s))
+    best_overlap = 0.0
+    for c in cand:
+        c_tokens = set(_extract_keywords_from_phrase(c))
+        if not s_tokens or not c_tokens:
+            continue
+        inter = s_tokens & c_tokens
+        union = s_tokens | c_tokens
+        overlap = (len(inter) / len(union)) if union else 0
+        if overlap > best_overlap:
+            best_overlap = overlap
+    if best_overlap >= _JACCARD_HIGH:
+        return True, 0.6
+    if best_overlap >= _JACCARD_MED:
+        return True, 0.5
+
+    model = get_embedding_model()
+    try:
+        if model is not None and cand:
+            s_emb = embed_texts([s])
+            cand_emb = embed_texts(cand)
+            if s_emb is not None and cand_emb is not None:
+                sims = cosine_sim(s_emb, cand_emb)
+                if sims is not None and sims.size > 0:
+                    if float(sims.max()) >= SIM_THRESHOLD:
+                        return True, 0.85
+    except Exception:
+        log.debug("embedding fallback in is_equivalent failed", exc_info=True)
 
     return False, 0.0
 
 
 # ---------- embedding helpers ----------
-EMBEDDING_MODEL_NAME = os.getenv("SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2")
-EMBEDDING_MODEL = None
-if SentenceTransformer is not None:
-    try:
-        EMBEDDING_MODEL = SentenceTransformer(EMBEDDING_MODEL_NAME)
-    except Exception:
-        EMBEDDING_MODEL = None
+from functools import lru_cache
+import time
 
+EMBEDDING_MODEL= os.getenv("SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2")
 SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", 0.65))
 
+@lru_cache(maxsize=1)
+def get_embedding_model():
+    if SentenceTransformer is None:
+        log.debug("SentenceTransformer not installed or failed import earlier.")
+        return None
+    try:
+        t0 = time.time()
+        model = SentenceTransformer(EMBEDDING_MODEL)
+        t1 = time.time()
+        log.info(f"Loaded embedding model '{EMBEDDING_MODEL}' in {t1-t0:.2f}s")
+        return model
+    except Exception:
+        log.exception("Failed to load SentenceTransformer model")
+        return None
 
 def embed_texts(texts):
-    if EMBEDDING_MODEL is None:
+    model = get_embedding_model()
+    if model is None:
         return None
     if texts is None:
         return None
     if isinstance(texts, str):
         texts = [texts]
     if not texts:
-        return np.zeros((0, EMBEDDING_MODEL.get_sentence_embedding_dimension()))
-    return EMBEDDING_MODEL.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+        return np.zeros((0, model.get_sentence_embedding_dimension()), dtype=np.float32)
+    try:
+        emb = model.encode(texts, convert_to_numpy=True, show_progress_bar=False)
+        if emb.dtype != np.float32:
+            emb = emb.astype(np.float32)
+        return emb
+    except Exception:
+        log.exception("embed_texts failed")
+        return None
 
 
 def cosine_sim(a, b):
     if a is None or b is None:
         return None
     try:
-        return util.cos_sim(a, b).cpu().numpy()
-    except Exception:
-        # numpy fallback
-        a_norm = a / np.linalg.norm(a, axis=1, keepdims=True)
-        b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
+        model = get_embedding_model()
+        if util is not None and model is not None:
+            try:
+                return util.cos_sim(a, b).cpu().numpy()
+            except Exception:
+                pass
+        a = np.asarray(a, dtype=np.float32)
+        b = np.asarray(b, dtype=np.float32)
+        if a.ndim == 1:
+            a = a.reshape(1, -1)
+        if b.ndim == 1:
+            b = b.reshape(1, -1)
+        a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
+        b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-8)
         return np.dot(a_norm, b_norm.T)
+    except Exception:
+        log.exception("cosine_sim fallback failed")
+        return None
 
 
 # ---------- parsing helpers ----------
@@ -245,68 +292,46 @@ def build_resume_prompt(raw_text):
         "input_text": raw_text or ""
     }
 
-
 def _split_sections_by_headings(text):
-    """
-    Naive section splitter: returns ordered dict {heading: content}
-    It finds known headings in the text and slices by their positions.
-    """
     import collections
     s_text = text.replace('\r', '\n')
-    # normalize multiple blank lines
     s_text = re.sub(r'\n{2,}', '\n\n', s_text)
-    # find headings (case-insensitive) by scanning lines
     lines = s_text.splitlines()
     indexes = []
     for i, line in enumerate(lines):
         clean = line.strip()
         for h in SECTION_HEADINGS:
-            # use regex search
             if re.fullmatch(h + r'[:\s]*', clean, flags=re.I):
                 indexes.append((i, clean))
                 break
-    # if no explicit headings, return full text as 'body'
     if not indexes:
         return {"body": s_text}
-    # build sections by slicing between heading indices
     sections = collections.OrderedDict()
     for idx, (line_idx, heading_line) in enumerate(indexes):
         start = line_idx + 1
         end = indexes[idx + 1][0] if idx + 1 < len(indexes) else len(lines)
         content = "\n".join(lines[start:end]).strip()
-        # normalize heading name
         heading_norm = re.sub(r'[:\s]+$', '', heading_line).strip()
         sections[heading_norm] = content
     return sections
 
-
 def _extract_contact_info(text):
-    """
-    Extract email, phone, website, name heuristically.
-    Returns dict.
-    """
     contact = {}
-    # email
     em = re.search(r'([A-Za-z0-9.\-_+]+@[A-Za-z0-9\-_]+\.[A-Za-z0-9.\-_]+)', text)
     if em:
         contact['email'] = em.group(1)
-    # phone (simple patterns - international optional)
     ph = re.search(r'(\+?\d{1,3}[\s\-]?)?(\(?\d{3}\)?[\s\-]?\d{3}[\s\-]?\d{4})', text)
     if ph:
         contact['phone'] = "".join([g for g in ph.groups() if g]).strip()
-    # website
     web = re.search(r'(https?://[^\s,;]+|www\.[^\s,;]+)', text)
     if web:
         contact['website'] = web.group(1)
-    # name heuristic: first non-empty line at top that looks like a name (2 words capitalized)
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     if lines:
         top = lines[0]
-        # if top contains a known label like "resume" skip
         if len(top.split()) <= 4 and re.search(r'[A-Z][a-z]+', top):
             contact['name'] = top
         else:
-            # try second line
             if len(lines) > 1 and len(lines[1].split()) <= 4:
                 contact['name'] = lines[1]
     return contact
@@ -319,39 +344,26 @@ VERB_KEYWORDS = [
     'evangelized', 'improved', 'created', 'co-led', 'co lead', 'organize', 'organized', 'manage', 'managing'
 ]
 
-
 def _looks_like_sentence(s):
-    """Return True if s looks like a sentence / description rather than a short skill token."""
     if not s or len(s.strip()) == 0:
         return True
-    # Many words -> likely a sentence/description
     if len(s.split()) > 6:
         return True
-    # Contains verbs (heuristic)
     low = s.lower()
     for v in VERB_KEYWORDS:
         if re.search(r'\b' + re.escape(v) + r'\b', low):
             return True
-    # Contains dates or year tokens -> not a skill
     if re.search(r'\b(19|20)\d{2}\b', s):
         return True
-    # multiple punctuation (likely a sentence)
     if len(re.findall(r'[.,;:]', s)) >= 2:
         return True
     return False
 
-
 def _lines_to_skills(content, strict=False):
-    """
-    Produce short, canonical skill tokens from a content block.
-    strict=True: only accept very short tokens (1-3 words), used for fallback header extraction.
-    """
     if not content:
         return []
-    # normalize bullet characters and newlines
     content = content.replace('•', '\n').replace('·', '\n').replace('–', '-').replace('\r', '\n')
     parts = []
-    # split on newlines and some separators, then on commas
     for part in re.split(r'[\n;/\u2022]', content):
         part = part.strip()
         if not part:
@@ -367,13 +379,10 @@ def _lines_to_skills(content, strict=False):
         token = token.strip(' .;:')
         if not token:
             continue
-        # discard obvious headings
         if token.lower() in ('skills', 'experience', 'education', 'projects', 'tech stack', 'techstack', 'tech:'):
             continue
-        # drop sentence-like tokens
         if _looks_like_sentence(token):
             continue
-        # strict mode: only accept at most 3 words
         if strict and len(token.split()) > 3:
             continue
         if len(token) < 2 or len(token) > 60:
@@ -1094,240 +1103,697 @@ def parse_job_description_text(raw_text):
 
 # ---------- 3. Semantic Match Score Logic (hybrid) ----------
 def semantic_match_score(resume_parsed, job_parsed):
-    # gather resume signals
-    resume_skills = resume_parsed.get("technical_skills", []) + resume_parsed.get("soft_skills", [])
-    resume_projects = resume_parsed.get("projects", [])
-    resume_exps = resume_parsed.get("experience", [])
-
-    # build resume sentences for embedding-based semantic matching
-    resume_sentences = []
-    for r in resume_exps:
-        if isinstance(r, dict):
-            resume_sentences += [r.get('role',''), r.get('description','')] + (r.get('achievements') or [])
-        elif isinstance(r, str):
-            resume_sentences.append(r)
-    for p in resume_projects:
-        if isinstance(p, dict):
-            resume_sentences += [p.get('name',''), p.get('description','')] + (p.get('technologies') or [])
-        elif isinstance(p, str):
-            resume_sentences.append(p)
-    resume_sentences += [s for s in resume_skills if isinstance(s, str)]
+    resume_skills = (resume_parsed.get("technical_skills", []) or []) + (resume_parsed.get("soft_skills", []) or [])
+    resume_projects = resume_parsed.get("projects", []) or []
+    resume_exps = resume_parsed.get("experience", []) or []
 
     job_crit = job_parsed.get("critical_skills", []) or []
     job_benef = job_parsed.get("beneficial_skills", []) or []
-    job_reqs = job_crit + job_benef
 
-    resume_emb = embed_texts(resume_sentences) if EMBEDDING_MODEL is not None else None
-    job_emb = embed_texts(job_reqs) if EMBEDDING_MODEL is not None else None
-    sim_matrix = cosine_sim(job_emb, resume_emb) if (job_emb is not None and resume_emb is not None) else None
+    CRIT_WEIGHT = 0.50
+    BEN_WEIGHT = 0.20
+    EXP_WEIGHT = 0.15
+    PROJ_WEIGHT = 0.15
 
-    crit_weight = 0.6
-    ben_weight = 0.2
-    exp_weight = 0.15
-    proj_weight = 0.05
+    _emb_cache = {}
+    def get_emb_once(text):
+        if not text:
+            return None
+        key = text if isinstance(text, str) else str(text)
+        if key in _emb_cache:
+            return _emb_cache[key]
+        emb = embed_texts(text)
+        _emb_cache[key] = emb
+        return emb
 
-    points = 0.0
-    max_points = 0.0
-    breakdown = {"critical": {}, "beneficial": {}, "experience": {}, "projects": {}}
-
-    # critical
-    for idx, s in enumerate(job_crit):
-        max_points += crit_weight * 1.5
-        matched, rule_score = is_equivalent(s, resume_skills)
-        sem_best = 0.0
-        if sim_matrix is not None and idx < sim_matrix.shape[0]:
-            row = sim_matrix[idx]
-            sem_best = float(row.max()) if row.size > 0 else 0.0
-        if matched and rule_score == 1.0:
-            points += crit_weight * 1.5
-            breakdown['critical'][s] = "+1.5 (exact)"
-        elif sem_best >= SIM_THRESHOLD:
-            points += crit_weight * 1.2
-            breakdown['critical'][s] = f"+1.2 (semantic {sem_best:.2f})"
-        elif sem_best >= (SIM_THRESHOLD - 0.15):
-            points += crit_weight * 0.7
-            breakdown['critical'][s] = f"+0.7 (partial semantic {sem_best:.2f})"
-        elif matched and rule_score == 0.5:
-            points += crit_weight * 0.5
-            breakdown['critical'][s] = "+0.5 (transferable)"
-        else:
-            points += crit_weight * -1.0
-            breakdown['critical'][s] = "-1 (missing)"
-
-    # beneficial
-    for i, s in enumerate(job_benef):
-        job_idx = len(job_crit) + i
-        max_points += ben_weight * 0.5
-        matched, rule_score = is_equivalent(s, resume_skills)
-        sem_best = 0.0
-        if sim_matrix is not None and job_idx < sim_matrix.shape[0]:
-            row = sim_matrix[job_idx]
-            sem_best = float(row.max()) if row.size > 0 else 0.0
-        if matched and rule_score >= 1.0:
-            points += ben_weight * 0.5
-            breakdown['beneficial'][s] = "+0.5 (exact)"
-        elif sem_best >= SIM_THRESHOLD:
-            points += ben_weight * 0.4
-            breakdown['beneficial'][s] = f"+0.4 (semantic {sem_best:.2f})"
-        elif matched and rule_score == 0.5:
-            points += ben_weight * 0.25
-            breakdown['beneficial'][s] = "+0.25 (transferable)"
-        else:
-            breakdown['beneficial'][s] = "0 (missing)"
-
-    # experience
-    years_req = job_parsed.get("years_required")
-    exp_pts = 0.0
-    if years_req:
-        resume_years = 0
-        for r in resume_exps:
-            if isinstance(r, dict):
-                try:
-                    start = int(re.search(r'(\d{4})', str(r.get('start') or '')) .group(1))
-                    end = int(re.search(r'(\d{4})', str(r.get('end') or '')) .group(1))
-                    resume_years += max(0, end - start)
-                except Exception:
-                    pass
-        if resume_years >= years_req:
-            exp_pts += exp_weight * 1.0
-            breakdown['experience'] = f"Meets years ({resume_years} >= {years_req})"
-        elif resume_years >= max(0, years_req - 1):
-            exp_pts += exp_weight * 0.5
-            breakdown['experience'] = f"Close ({resume_years} ~ {years_req})"
-        else:
-            exp_pts -= exp_weight * 0.5
-            breakdown['experience'] = f"Under ({resume_years} < {years_req})"
-    else:
-        req_level = (job_parsed.get("experience_level") or "Unknown").lower()
-        cnt = len(resume_exps)
-        guess = 'senior' if cnt >= 4 else ('mid' if cnt >= 2 else 'junior')
-        if guess == req_level:
-            exp_pts += exp_weight * 1.0
-            breakdown['experience'] = f"Level matches ({guess})"
-        elif guess in ('mid','senior') and req_level in ('junior','mid'):
-            exp_pts += exp_weight * 0.5
-            breakdown['experience'] = f"Close ({guess} vs {req_level})"
-        else:
-            exp_pts -= exp_weight * 0.5
-            breakdown['experience'] = f"Mismatch ({guess} vs {req_level})"
-    points += exp_pts
-    max_points += exp_weight * 1.0
-
-    # projects
-    proj_pts = 0.0
+    resume_sentences = []
     for p in resume_projects:
-        proj_name = p.get('name', 'project') if isinstance(p, dict) else (p or 'project')
-        techs = p.get('technologies', []) if isinstance(p, dict) else []
-        overlap = 0
-        for s in job_crit:
-            m, _ = is_equivalent(s, techs)
-            if m:
-                overlap += 1
+        if isinstance(p, dict):
+            if p.get('name'):
+                resume_sentences.append(p.get('name'))
+            if p.get('description'):
+                resume_sentences.append(p.get('description'))
+            for t in (p.get('technologies') or []):
+                if t:
+                    resume_sentences.append(t)
+    for r in resume_exps:
+        if isinstance(r, dict):
+            if r.get('role'):
+                resume_sentences.append(r.get('role'))
+            if r.get('description'):
+                resume_sentences.append(r.get('description'))
+    resume_sentences += [s for s in resume_skills if isinstance(s, str) and s.strip()]
+
+    job_reqs = [s for s in job_crit if s] + [s for s in job_benef if s]
+
+    model = get_embedding_model()
+    resume_emb = None
+    job_emb = None
+    sim_matrix = None
+    try:
+        if model is not None:
+            if resume_sentences:
+                # embed list directly (cached)
+                resume_emb = get_emb_once(tuple(resume_sentences)) or embed_texts(resume_sentences)
+            if job_reqs:
+                job_emb = get_emb_once(tuple(job_reqs)) or embed_texts(job_reqs)
+            if job_emb is not None and resume_emb is not None:
+                if getattr(job_emb, "size", 0) and getattr(resume_emb, "size", 0):
+                    sim_matrix = cosine_sim(job_emb, resume_emb)
+            log.debug("semantic_match_score: model_loaded=%s, job_emb_shape=%s, resume_emb_shape=%s",
+                      (model is not None),
+                      None if job_emb is None else getattr(job_emb, 'shape', None),
+                      None if resume_emb is None else getattr(resume_emb, 'shape', None))
+    except Exception:
+        log.exception("Embedding precompute failed in semantic_match_score; continuing with rule-based checks.")
+
+    num_crit = max(1, len(job_crit))
+    num_ben = max(1, len(job_benef))
+
+    breakdown = {"critical": {}, "beneficial": {}, "experience": {}, "projects": {}}
+    weighted_sum = 0.0
+
+    def compute_skill_credit(skill_text, idx_in_job_reqs=None, cand_resume_list=None):
+        cand_resume_list = cand_resume_list or resume_skills
+        matched, rule_score = is_equivalent(skill_text, cand_resume_list)
+        sem_best = 0.0
+        if sim_matrix is not None and idx_in_job_reqs is not None:
+            try:
+                if 0 <= idx_in_job_reqs < sim_matrix.shape[0]:
+                    row = sim_matrix[idx_in_job_reqs]
+                    if row is not None and getattr(row, "size", 0):
+                        sem_best = float(row.max())
+            except Exception:
+                log.debug("sim_matrix indexing error for idx %s", idx_in_job_reqs, exc_info=True)
+        if matched and rule_score >= 1.0:
+            return 1.0, f"1.00 (exact rule)"
+        if sem_best >= SIM_THRESHOLD:
+            return 0.9, f"{0.9:.2f} (semantic {sem_best:.2f})"
+        if sem_best >= (SIM_THRESHOLD - 0.15):
+            return 0.6, f"{0.6:.2f} (partial semantic {sem_best:.2f})"
+        if matched and rule_score >= 0.45:
+            return 0.5, f"{0.5:.2f} (transferable)"
+        return 0.0, "0 (missing)"
+
+    for i, s in enumerate(job_crit):
+        credit, reason = compute_skill_credit(s, idx_in_job_reqs=i, cand_resume_list=resume_skills)
+        contrib = (credit * CRIT_WEIGHT) / num_crit
+        weighted_sum += contrib
+        breakdown['critical'][s] = reason
+
+    base_idx = len(job_crit)
+    for j, s in enumerate(job_benef):
+        idx = base_idx + j
+        credit, reason = compute_skill_credit(s, idx_in_job_reqs=idx, cand_resume_list=resume_skills)
+        contrib = (credit * BEN_WEIGHT) / num_ben
+        weighted_sum += contrib
+        breakdown['beneficial'][s] = reason
+
+    # Experience computation: structured years then summary then fallback
+    resume_years = 0
+    for r in resume_exps:
+        if isinstance(r, dict):
+            s = r.get('start') or ""
+            e = r.get('end') or ""
+            ys = re.findall(r'(\d{4})', str(s))
+            ye = re.findall(r'(\d{4})', str(e))
+            try:
+                if ys and ye:
+                    start_y = int(ys[0])
+                    end_y = int(ye[-1])
+                    resume_years += max(0, end_y - start_y)
+                elif ys and (not ye):
+                    resume_years += max(0, (int(time.strftime("%Y")) - int(ys[0])))
+            except Exception:
+                pass
+
+    summary = (resume_parsed.get("summary") or "")
+    # capture "3+ years" or "3 years"
+    m = re.search(r'(\d+)\+?\s+years', summary, flags=re.I)
+    if m:
+        try:
+            years_val = int(m.group(1))
+            resume_years = max(resume_years, years_val)
+        except Exception:
+            pass
+    else:
+        # also try small word numbers like "three years"
+        WORD_NUMS = {
+            'one': 1, 'two': 2, 'three': 3, 'four': 4, 'five': 5,
+            'six': 6, 'seven': 7, 'eight': 8, 'nine': 9, 'ten': 10
+        }
+        for word, val in WORD_NUMS.items():
+            if re.search(r'\b' + re.escape(word) + r'(?:\+)?\s+years?\b', summary, flags=re.I):
+                resume_years = max(resume_years, val)
+                break
+
+    years_req = job_parsed.get("years_required")
+    exp_credit = 0.0
+    if years_req:
+        try:
+            years_req_i = int(years_req)
+        except Exception:
+            years_req_i = None
+        if years_req_i:
+            if resume_years >= years_req_i:
+                exp_credit = 1.0
+                breakdown['experience'] = f"Meets years ({resume_years} >= {years_req_i})"
+            elif resume_years >= max(0, years_req_i - 1):
+                exp_credit = 0.6
+                breakdown['experience'] = f"Close ({resume_years} ~ {years_req_i})"
             else:
-                # semantic check between job requirement and project text if embeddings available
-                if EMBEDDING_MODEL is not None:
-                    try:
-                        job_emb_single = embed_texts(s)
-                        proj_text = ""
-                        if isinstance(p, dict):
-                            proj_text = " ".join([p.get('name',''), p.get('description',''), " ".join(techs)])
-                        else:
-                            proj_text = p
-                        proj_emb_single = embed_texts(proj_text)
-                        if job_emb_single is not None and proj_emb_single is not None:
-                            sim = cosine_sim(job_emb_single, proj_emb_single)
-                            if sim is not None and sim.size > 0 and float(sim.max()) >= SIM_THRESHOLD:
-                                overlap += 1
-                    except Exception:
-                        pass
-        if overlap >= 2:
-            proj_pts += proj_weight * 1.0
-            breakdown['projects'][proj_name] = "Highly relevant"
-        elif overlap == 1:
-            proj_pts += proj_weight * 0.5
-            breakdown['projects'][proj_name] = "Somewhat relevant"
+                exp_credit = 0.0
+                breakdown['experience'] = f"Under ({resume_years} < {years_req_i})"
         else:
-            breakdown['projects'][proj_name] = "Not relevant"
+            # fallback as below
+            pass
+    if not years_req:
+        cnt = len([e for e in resume_exps if isinstance(e, dict)])
+        if resume_years >= 5 or cnt >= 4:
+            exp_credit = 1.0
+            breakdown['experience'] = "Senior inferred"
+        elif resume_years >= 2 or cnt >= 2:
+            exp_credit = 0.6
+            breakdown['experience'] = "Mid inferred"
+        else:
+            exp_credit = 0.2
+            breakdown['experience'] = f"Early career inferred ({resume_years} yrs)"
 
-    points += proj_pts
-    max_points += proj_weight * 1.0
+    weighted_sum += exp_credit * EXP_WEIGHT
 
-    # scale to 0-10
-    score = 0.0
-    if max_points > 0:
-        score = (points / max_points) * 10.0
-    score = max(0.0, min(10.0, score))
+    proj_credit_total = 0.0
+    if resume_projects:
+        for p in resume_projects:
+            if not isinstance(p, dict):
+                continue
+            techs = p.get('technologies') or []
+            # normalize tech tokens
+            techs_norm = []
+            for t in techs:
+                if t and isinstance(t, str):
+                    n = _normalize_token(t)
+                    if n:
+                        techs_norm.append(n)
+            # If after normalization techs empty, try inference from description
+            if not techs_norm:
+                desc = (p.get('description') or "") + " " + (p.get('name') or "")
+                inferred = []
+                # quick heuristic: find occurrences of common tech words
+                common_techs = r'\b(python|flask|fastapi|docker|kubernetes|aws|azure|sql|postgresql|postgres|mysql|node\.js|react|django|java|c\+\+|c#|go|golang)\b'
+                for m in re.finditer(common_techs, desc, flags=re.I):
+                    tok = _normalize_token(m.group(1))
+                    if tok and tok not in inferred:
+                        inferred.append(tok)
+                techs_norm = inferred
+            overlap_cnt = 0
+            for s in job_crit:
+                m, _ = is_equivalent(s, techs_norm)
+                if m:
+                    overlap_cnt += 1
+            proj_text = " ".join(filter(None, [p.get('name',''), p.get('description',''), " ".join(techs_norm)]))
+            proj_emb = get_emb_once(proj_text) if model is not None else None
+            sem_score = 0.0
+            if proj_emb is not None and job_emb is not None:
+                try:
+                    sims = cosine_sim(job_emb, proj_emb)
+                    if sims is not None and sims.size:
+                        sem_score = float(sims.max())
+                except Exception:
+                    sem_score = 0.0
+            token_score = min(1.0, overlap_cnt / max(1.0, len(job_crit)))
+            proj_relevance = max(token_score * 0.7, sem_score * 0.9)
+            proj_credit_total += proj_relevance
+            breakdown['projects'][p.get('name','project')] = f"rel:{proj_relevance:.2f} (tokens:{overlap_cnt},sem:{sem_score:.2f})"
+        proj_credit = (proj_credit_total / len(resume_projects))
+    else:
+        proj_credit = 0.0
+    weighted_sum += proj_credit * PROJ_WEIGHT
+
+    final_score = max(0.0, min(1.0, weighted_sum)) * 10.0
     rating = "Weak"
-    if score >= 8.0:
+    if final_score >= 8.0:
         rating = "Excellent"
-    elif score >= 6.0:
+    elif final_score >= 6.0:
         rating = "Strong"
-    elif score >= 4.0:
+    elif final_score >= 4.0:
         rating = "Moderate"
 
     return {
-        "score": round(score, 2),
+        "score": round(final_score, 2),
         "rating": rating,
         "breakdown": breakdown,
-        "raw_points": round(points, 4),
-        "max_points": round(max_points, 4)
+        "raw_points": round(weighted_sum, 4),
+        "max_points": 1.0
     }
 
 
 # ---------- 4. Gap Analysis ----------
-def gap_analysis(resume_parsed, job_parsed, top_n=5):
-    resume_skills = resume_parsed.get("technical_skills", []) + resume_parsed.get("soft_skills", [])
-    critical = job_parsed.get("critical_skills", [])[:50]
-    beneficial = job_parsed.get("beneficial_skills", [])[:50]
+def gap_analysis(resume_parsed, job_parsed, top_n=8):
+    resume_skills = (resume_parsed.get("technical_skills", []) or []) + (resume_parsed.get("soft_skills", []) or [])
+    raw_critical = job_parsed.get("critical_skills", []) or []
+    beneficial = job_parsed.get("beneficial_skills", []) or []
+
+    crit_candidates = []
+    for item in raw_critical:
+        if not item:
+            continue
+        if _looks_like_sentence(item) or len(item.split()) > 5:
+            kws = _extract_keywords_from_phrase(item, max_terms=6)
+            # join kws into small phrases where possible before normalizing
+            if kws:
+                # attempt grouping into short multi-word tokens (two-word phrases)
+                twos = []
+                for i in range(len(kws)-1):
+                    twos.append(kws[i] + " " + kws[i+1])
+                candidates = kws + twos
+            else:
+                candidates = [item]
+            norm = auto_normalize_skills(candidates)
+            if norm:
+                crit_candidates.extend(norm)
+            else:
+                short = _lines_to_skills(item, strict=True)
+                if short:
+                    crit_candidates.extend(auto_normalize_skills(short))
+                else:
+                    # fallback: keep first 3 words if they look ok
+                    first = " ".join(item.strip().split()[:3])
+                    norm2 = auto_normalize_skills([first])
+                    if norm2:
+                        crit_candidates.extend(norm2)
+        else:
+            norm = auto_normalize_skills([item])
+            if norm:
+                crit_candidates.extend(norm)
+            else:
+                crit_candidates.append(item.strip())
+
+    seen = set()
+    critical = []
+    for c in crit_candidates:
+        if not c:
+            continue
+        k = c.lower().strip()
+        if k not in seen:
+            seen.add(k)
+            critical.append(c)
+
     gaps = []
     for s in critical:
         matched, score = is_equivalent(s, resume_skills)
-        if not matched:
-            transferable = False
-            related_alts = []
-            for key, alts in EQUIVALENCES.items():
-                if s.lower() == key:
-                    for a in alts:
-                        if normalize_token(a) in [normalize_token(x) for x in resume_skills]:
-                            transferable = True
-                            related_alts.append(a)
-            typ = 'transferable' if transferable else 'missing'
-            suggestion = (f"Your related experience (e.g., {', '.join(related_alts)}) covers {s}. Highlight it."
-                          if transferable else
-                          f"Consider learning {s}. Short actionable: 2-6 hours tutorial + a small project.")
-            gaps.append({"skill": s, "type": typ, "importance": 1.0, "suggestion": suggestion})
-    for s in beneficial:
+        if matched:
+            continue
+        transferable = False
+        related = []
+        for key, alts in EQUIVALENCES.items():
+            if normalize_token(s) == normalize_token(key):
+                for a in alts:
+                    if normalize_token(a) in [normalize_token(x) for x in resume_skills]:
+                        transferable = True
+                        related.append(a)
+        s_tokens = set(_extract_keywords_from_phrase(s))
+        for rs in resume_skills:
+            r_tokens = set(_extract_keywords_from_phrase(rs))
+            if s_tokens and r_tokens:
+                ov = len(s_tokens & r_tokens) / float(len(s_tokens | r_tokens))
+                if ov >= 0.20 and ov < _JACCARD_HIGH:
+                    transferable = True
+                    related.append(rs)
+        if transferable:
+            suggestion = f"Highlight related experience: {', '.join(list(dict.fromkeys(related))[:3])}. Move those bullets to top of experience or summary."
+            gaps.append({"skill": s, "type": "transferable", "importance": 1.0, "suggestion": suggestion})
+        else:
+            suggestion = f"This role requires '{s}' but your resume doesn't mention it. Consider adding it or a short micro-project demonstrating it (e.g., small Dockerized API)."
+            gaps.append({"skill": s, "type": "missing", "importance": 1.0, "suggestion": suggestion})
+
+    ben_norm = []
+    for b in beneficial:
+        norm = auto_normalize_skills([b]) or [b]
+        ben_norm.extend(norm)
+    for s in ben_norm:
         matched, _ = is_equivalent(s, resume_skills)
         if not matched:
-            gaps.append({"skill": s, "type": "learnable", "importance": 0.4, "suggestion": f"Optional but helpful: learn {s} through a short course."})
+            suggestion = f"Optional but helpful: learn '{s}' and add a demonstrable artifact or short project."
+            gaps.append({"skill": s, "type": "learnable", "importance": 0.4, "suggestion": suggestion})
+
     gaps_sorted = sorted(gaps, key=lambda x: (-x['importance'], x['type']))
     return gaps_sorted[:top_n]
 
 
 # ---------- 5. Recommendation generator ----------
-def generate_personalized_recommendation(resume_parsed, job_parsed, gaps):
-    projects = resume_parsed.get("projects", [])
-    # Type A: reframe best project
-    best = None
+def generate_personalized_recommendation(resume_parsed, job_parsed, gaps, use_llm=False, llm_fn=None):
+    """
+    Produce a recommendation tailored to resume_parsed and job_parsed using gaps.
+    Returns a dict with keys:
+      - kind: one of "A","B","C","D"
+      - text: human-facing recommendation
+      - example_bullet: (optional) a copy-paste bullet the candidate can put on resume
+      - micro_project: (optional) dict describing steps when relevant
+      - project: (optional) best_project dict if Type A
+    """
+    projects = resume_parsed.get("projects", []) or []
+    # normalize any declared techs
     for p in projects:
-        if isinstance(p, dict) and p.get('metrics'):
-            best = p; break
-    if not best and projects:
-        best = projects[0]
-    if best:
-        name = best.get('name','Project')
-        techs = best.get('technologies', [])
-        metrics = best.get('metrics') or "improved performance / delivered feature"
-        text = f"Type A - Reframe: 'Developed {name} using {', '.join(techs)} — {metrics}.' Emphasize metrics and responsibilities aligned to the job."
-        return {"kind": "A", "text": text}
-    # Type B: transferable
-    for g in gaps:
-        if g['type'] == 'transferable':
-            return {"kind":"B", "text": f"Type B - Highlight transferable: {g['suggestion']}. Add explicit mention in skills/summary."}
-    if gaps:
-        s = gaps[0]['skill']
-        return {"kind":"C", "text": f"Type C - Add unstated skill: If you have used tools related to {s}, list them explicitly on your resume."}
-    return {"kind":"D", "text":"Type D - Learn gap: Complete a short tutorial (2-8 hours) and add a small project demonstrating it."}
+        techs = p.get('technologies') or []
+        if techs:
+            norm = []
+            for t in techs:
+                if not t:
+                    continue
+                n = _normalize_token(t)
+                if n:
+                    norm.append(n)
+            p['technologies'] = norm
+
+    # quick helper to infer tech tokens from text
+    def infer_techs_from_text(txt):
+        if not txt:
+            return []
+        common_techs_re = r'\b(python|flask|fastapi|django|docker|kubernetes|aws|azure|gcp|sql|sqlite|postgresql|postgres|mysql|node\.js|react|java|c\+\+|c#|go|golang)\b'
+        found = []
+        for m in re.finditer(common_techs_re, txt, flags=re.I):
+            tok = _normalize_token(m.group(1))
+            if tok and tok not in found:
+                found.append(tok)
+        return found
+
+    # Embedding utilities (safe cached)
+    model = get_embedding_model()
+    _emb_cache = {}
+    def get_emb_once_local(text):
+        if not text:
+            return None
+        key = text if isinstance(text, str) else str(text)
+        if key in _emb_cache:
+            return _emb_cache[key]
+        emb = embed_texts(text)
+        _emb_cache[key] = emb
+        return emb
+
+    # Score projects for relevance (token overlap + semantic)
+    job_crit = job_parsed.get("critical_skills", []) or []
+    best_project = None
+    best_score = 0.0
+    for p in projects:
+        name = p.get('name','').strip()
+        techs = p.get('technologies') or []
+        # infer if empty
+        if not techs:
+            techs = infer_techs_from_text((p.get('description') or "") + " " + name)
+        # token overlap metric
+        token_overlap = 0.0
+        if techs and job_crit:
+            overlaps = 0
+            for jc in job_crit:
+                matched, _ = is_equivalent(jc, techs)
+                if matched:
+                    overlaps += 1
+            token_overlap = overlaps / max(1.0, len(job_crit))
+        # semantic similarity
+        sem_score = 0.0
+        try:
+            if model is not None:
+                proj_text = " ".join(filter(None, [name, p.get('description',''), " ".join(techs)]))
+                p_emb = get_emb_once_local(proj_text)
+                if p_emb is not None and job_crit:
+                    j_emb = get_emb_once_local(tuple(job_crit)) or embed_texts(job_crit)
+                    if j_emb is not None:
+                        sims = cosine_sim(j_emb, p_emb)
+                        if sims is not None and getattr(sims, "size", 0):
+                            sem_score = float(sims.max())
+        except Exception:
+            sem_score = 0.0
+        relevance = max(token_overlap * 0.75, sem_score * 0.9)
+        # small boost to projects with explicit techs
+        if techs:
+            relevance += 0.05
+        if relevance > best_score:
+            best_score = relevance
+            best_project = p
+
+    # If we found a strongly relevant project, produce Type A (reframe)
+    if best_project and best_score >= 0.45:
+        name = best_project.get('name','Project')
+        techs = best_project.get('technologies') or []
+        if not techs:
+            techs = infer_techs_from_text((best_project.get('description') or "") + " " + name)
+        desc = (best_project.get('description') or "").strip()
+        short_desc = (desc[:180] + '...') if len(desc) > 180 else desc
+        example_bullet = f"Developed {name} using {', '.join(techs[:4])} — {short_desc}" if techs else f"Developed {name} — {short_desc}"
+        text_template = (
+            f"Type A — Reframe an existing project: Move the project '{name}' to the top of your experience. "
+            f"Open the project bullet with technologies ({', '.join(techs[:4])}) and a one-line impact/delivery statement. "
+            f"Example bullet: \"{example_bullet}\""
+        )
+        return {
+            "kind": "A",
+            "text": text_template,
+            "example_bullet": example_bullet,
+            "project": best_project
+        }
+
+    # No strong project: analyze gaps for transferable vs missing
+    missing = [g for g in (gaps or []) if g.get('type') == 'missing']
+    transferable = [g for g in (gaps or []) if g.get('type') == 'transferable']
+    learnable = [g for g in (gaps or []) if g.get('type') == 'learnable']
+
+    # If transferable gaps exist, give a Type B recommendation (how to reframe)
+    if transferable:
+        top = transferable[0]
+        related = top.get('suggestion') or ""
+        text = (
+            f"Type B — Highlight transferable experience: {related}. "
+            f"Suggested action: Move the related bullets to the top of your experience section and add a one-line summary in your resume summary mentioning "
+            f"collaboration with engineering or instrumentation (e.g., \"Instrumented product prototype and collaborated with engineers on deployment\")."
+        )
+        example_bullet = None
+        # attempt to construct one using project names or descriptions
+        if projects:
+            sample = projects[0]
+            pname = sample.get('name') or "Project"
+            ptech = sample.get('technologies') or infer_techs_from_text((sample.get('description') or "") + " " + pname)
+            if ptech:
+                example_bullet = f"Collaborated on {pname} (used {', '.join(ptech[:4])}) to instrument and validate product flows with engineering partners."
+            else:
+                example_bullet = f"Collaborated on {pname} to instrument prototype and validate product flows with engineering partners."
+        return {"kind": "B", "text": text, "example_bullet": example_bullet}
+
+    # If critical missing skills exist, build a concrete Type C micro-project plan
+    if missing:
+        # prioritize top 3 missing criticals
+        top_missing = [m['skill'] for m in missing[:3]]
+        # map missing tokens to a concrete micro-project stack
+        stack = []
+        if any(re.search(r'\bdocker\b', s, flags=re.I) for s in top_missing):
+            stack.append('Docker')
+        if any(re.search(r'\bpython\b|\bflask\b|\bfastapi\b', s, flags=re.I) for s in top_missing):
+            stack.append('Python (Flask or FastAPI)')
+        if any(re.search(r'\bsql\b|\bpostgres\b|\bmysql\b|\bsqlite\b', s, flags=re.I) for s in top_missing):
+            stack.append('SQLite / SQL')
+        if any(re.search(r'\baws\b|\bazure\b|\bgcp\b|\bcloud\b', s, flags=re.I) for s in top_missing):
+            stack.append('Cloud (Deploy to Render/Heroku/AWS Free Tier)')
+        if any(re.search(r'\bapi\b|\bbackend\b|\bserver\b|\bmicroservice\b', s, flags=re.I) for s in top_missing):
+            if 'Python (Flask or FastAPI)' not in stack:
+                stack.append('Python (Flask or FastAPI)')
+
+        # default fallback stack if stack empty but missing exists
+        if not stack:
+            stack = ['Python (Flask)', 'SQLite', 'Docker', 'Deploy (Render/Heroku)']
+
+        # construct micro-project steps tightly mapped to missing skills
+        micro_steps = [
+            f"1) Build a minimal REST API implementing one resource (e.g., inventory endpoint) using {stack[0]}.",
+            f"2) Persist sample data using {stack[1] if len(stack)>1 else 'SQLite'} (CRUD endpoints).",
+            f"3) Add basic unit tests for the API endpoints (pytest/unittest).",
+            f"4) Create a Dockerfile to containerize the service and verify it runs locally in a container.",
+            f"5) Deploy the container to a free host (Render / Heroku / AWS free tier) and add a short README describing the architecture & deployment steps.",
+            f"6) Add a single-line measurable demo in README (e.g., sample curl requests) and include the GitHub link in your resume."
+        ]
+        micro_project = {
+            "title": f"Micro-project targeted to: {', '.join(top_missing)}",
+            "stack": stack,
+            "steps": micro_steps
+        }
+
+        # example resume bullet tailored to the micro-project & job title
+        job_title = job_parsed.get('title') or "the role"
+        example_bullet = (
+            f"Built a {job_title}-relevant prototype (Flask API + SQLite + Docker); containerized and deployed the prototype to Render, "
+            "documented deployment steps and integration notes to demonstrate end-to-end functionality."
+        )
+
+        text = (
+            f"Type C — Missing critical skills: {', '.join(top_missing)}. "
+            f"Suggested micro-project (4–8 hours) using: {', '.join(stack)}. "
+            "Follow the steps below to produce an artifact you can link on your resume and highlight in your experience."
+        )
+
+        return {
+            "kind": "C",
+            "text": text,
+            "micro_project": micro_project,
+            "example_bullet": example_bullet
+        }
+
+    # If we reach here, nothing clear missing/transferable — produce a contextual Type D
+    job_title = job_parsed.get('title') or job_parsed.get('role') or "this role"
+    ben = job_parsed.get('beneficial_skills') or []
+    ben_short = ", ".join(auto_normalize_skills(ben[:4])) if ben else "relevant beneficial skills"
+    text = (
+        f"Type D — No clear project to reframe and no critical skills detected as missing. "
+        f"Suggested: pick a short micro-project that shows backend basics tailored to {job_title}: focus on {ben_short} and one backend stack (Python + Docker + SQL)."
+    )
+    micro_project = {
+        "title": f"Starter micro-project for {job_title}",
+        "stack": ["Python (Flask)", "SQLite", "Docker", "Deploy (Render)"],
+        "steps": [
+            "1) Create a simple Flask API that returns JSON for one endpoint.",
+            "2) Store and retrieve data using SQLite.",
+            "3) Add a Dockerfile and run locally as a container.",
+            "4) Deploy to Render/Heroku and add README with instructions."
+        ]
+    }
+    example_bullet = "Built a small Flask + Docker prototype demonstrating an end-to-end API; documented deployment steps and linked GitHub."
+    return {"kind": "D", "text": text, "micro_project": micro_project, "example_bullet": example_bullet}
+
+import json
+
+# Allowed tech tokens / short allowlist (extend as needed)
+_ALLOWED_TECH_TOKENS = {
+    'python','flask','fastapi','django','docker','kubernetes','aws','azure','gcp',
+    'sql','sqlite','postgresql','postgres','mysql','node.js','react','java','c++',
+    'c#','go','golang','powerbi','tableau','excel','salesforce','hubspot'
+}
+
+def _llm_validate_and_parse(json_text, resume_parsed, job_parsed):
+    """
+    Validate LLM JSON output conservatively:
+    - Must be valid JSON with required keys
+    - example_bullet must not invent numbers or metrics
+    - any mentioned tech must be in resume or job or in allowlist
+    Returns (valid:bool, parsed_obj/dict or error_msg)
+    """
+    try:
+        obj = json.loads(json_text)
+    except Exception as e:
+        return False, f"invalid_json: {e}"
+
+    # expected schema keys
+    allowed_keys = {'kind','text','example_bullet','micro_project','project'}
+    if not isinstance(obj, dict):
+        return False, "json_not_object"
+    if not obj.get('kind') or obj['kind'] not in {'A','B','C','D'}:
+        return False, "missing_or_invalid_kind"
+
+    # validate text presence
+    if 'text' not in obj or not isinstance(obj['text'], str):
+        return False, "missing_text"
+
+    # no invented numbers: example_bullet must not contain % or numeric claims unless present in inputs
+    eb = obj.get('example_bullet') or ""
+    if any(re.search(r'\b\d{1,3}%|\b\d{1,4}\b', token) for token in re.findall(r'\S+', eb)):
+        # if numbers appear in resume_parsed or job_parsed, allow those specific numbers
+        inputs_combined = json.dumps(resume_parsed) + json.dumps(job_parsed)
+        numbers_in_input = set(re.findall(r'\b\d{1,4}\b|\b\d{1,3}%\b', inputs_combined))
+        numbers_in_eb = set(re.findall(r'\b\d{1,4}\b|\b\d{1,3}%\b', eb))
+        if not numbers_in_eb.issubset(numbers_in_input):
+            return False, "invented_numbers_in_example_bullet"
+
+    # tech token validation: ensure technologies mentioned appear in resume/job or allowed set
+    mentioned_techs = set([t.lower() for t in re.findall(r'\b([A-Za-z0-9\+\#\.]{2,30})\b', eb)])
+    # build a small corpus of allowed tokens from resume/job
+    corpus = set()
+    for k in ('technical_skills','projects','experience','summary'):
+        v = resume_parsed.get(k) or ""
+        corpus.update(re.findall(r'\b[a-zA-Z0-9\+\#\-\.]{2,30}\b', str(v)))
+    for k in ('critical_skills','beneficial_skills','title'):
+        v = job_parsed.get(k) or ""
+        corpus.update(re.findall(r'\b[a-zA-Z0-9\+\#\-\.]{2,30}\b', str(v)))
+    corpus = set([c.lower() for c in corpus])
+    # If a token looks like a tech (quick heuristic) and is not in corpus or allowlist, fail
+    suspicious = [t for t in mentioned_techs if t.isalpha() and len(t) <= 30 and t not in corpus and t not in _ALLOWED_TECH_TOKENS]
+    if suspicious:
+        # allow common words that are not techs; filter by lowercase common english words is optional
+        # to be safe, reject when suspicious tech-like tokens found
+        return False, f"unvalidated_tokens:{','.join(suspicious)}"
+
+    # micro_project check (if present) must be a dict and contain 'steps' list
+    if 'micro_project' in obj:
+        mp = obj['micro_project']
+        if not isinstance(mp, dict):
+            return False, "micro_project_not_object"
+        if 'steps' not in mp or not isinstance(mp['steps'], list):
+            return False, "micro_project_steps_missing"
+
+    return True, obj
+
+def _call_llm_for_recommendation(resume_parsed, job_parsed, gaps, llm_fn):
+    """
+    Build a constrained prompt and call llm_fn(prompt, temperature=0.0).
+    Expect the model to return strict JSON. Return parsed dict or None.
+    """
+    # Build short facts block
+    def shortify(obj, keys, max_chars=1000):
+        out = []
+        for k in keys:
+            v = obj.get(k)
+            if not v:
+                continue
+            s = str(v)
+            if len(s) > max_chars:
+                s = s[:max_chars] + "..."
+            out.append(f"{k}: {s}")
+        return "\n".join(out)
+
+    resume_facts = shortify(resume_parsed, ["summary","technical_skills","projects"])
+    job_facts = shortify(job_parsed, ["title","critical_skills","beneficial_skills","years_required"])
+    gaps_small = json.dumps(gaps[:6], ensure_ascii=False)
+
+    prompt = f"""
+You are a concise career assistant. INPUTS (only use the facts below; do NOT invent facts or numbers):
+----- RESUME FACTS -----
+{resume_facts}
+
+----- JOB FACTS -----
+{job_facts}
+
+----- TOP GAPS (from earlier analysis) -----
+{gaps_small}
+
+TASK:
+Produce a single JSON object (no surrounding text) with these keys:
+- kind: one of "A","B","C","D"
+- text: a short recommendation sentence (<= 300 chars)
+- example_bullet: a single resume bullet candidate (<= 200 chars). Do NOT invent numeric claims (percentages, counts); only reuse numbers present in the inputs if any.
+- micro_project: optional object with "title" (string) and "steps" (list of short step strings). Steps should be concrete, practical, and match the missing skills.
+
+Important constraints:
+1) Use only facts in the RESUME or JOB blocks. If you need to suggest a tech, prefer technologies already in resume/projects or in job criticals; otherwise suggest conservative, common stacks (e.g., Python/Flask, SQLite, Docker).
+2) Do NOT invent metrics (no "%", no "reduced X by Y%" unless the number appears in the inputs).
+3) Output must be valid JSON only. No extra explanation.
+4) Keep temperature/creativity low; be pragmatic and concise.
+
+Return only the JSON object.
+"""
+
+    # call LLM with low temperature; your llm_fn should accept temperature param
+    try:
+        # adapt to the llm_fn signature available in your environment
+        try:
+            raw = llm_fn(prompt, temperature=0.0)
+        except TypeError:
+            # fallback if llm_fn doesn't accept temperature
+            raw = llm_fn(prompt)
+    except Exception as e:
+        log.exception("LLM call failed: %s", e)
+        return None
+
+    # try parsing and validating
+    valid, parsed_or_err = _llm_validate_and_parse(raw, resume_parsed, job_parsed)
+    if not valid:
+        log.warning("LLM recommendation validation failed: %s. Raw response: %s", parsed_or_err, raw[:200])
+        return None
+    return parsed_or_err
 
 
 # ---------- 6. Simple NL handler ----------
@@ -1348,9 +1814,9 @@ def handle_nl_query(session_parsed_resume, session_parsed_job, last_turns, query
     return {"intent":"unknown", "answer":"I can: (1) give skill roadmap, (2) readiness check, (3) specific skill relevance."}
 
 
-def _load_skill_embeddings(limit=None):
+def _load_skill_embeddings(limit=None, expected_dim=None):
     """
-    Load skills with embeddings into memory.
+    Load skills with embeddings and validate shapes/dtype.
     Returns (skill_objs_list, embeddings_array (n,d), names_list)
     """
     if Skill is None:
@@ -1363,38 +1829,46 @@ def _load_skill_embeddings(limit=None):
         return [], None, []
     vecs = []
     names = []
+    bad = []
     for s in skills:
         try:
             arr = np.frombuffer(s.embedding, dtype=np.float32)
-            vecs.append(arr)
-            names.append(s.name)
+            # If expected_dim provided, check
+            if expected_dim and arr.size % expected_dim != 0:
+                bad.append((s, arr.shape))
+                continue
+            if arr.ndim == 1:
+                vecs.append(arr)
+                names.append(s.name)
+            else:
+                bad.append((s, arr.shape))
         except Exception:
-            vecs.append(None)
-            names.append(s.name)
-    idx_valid = [i for i,v in enumerate(vecs) if v is not None]
-    if not idx_valid:
+            bad.append((s, None))
+    if not vecs:
         return [], None, []
-    vecs_arr = np.stack([vecs[i] for i in idx_valid], axis=0)
-    skills_valid = [skills[i] for i in idx_valid]
-    names_valid = [names[i] for i in idx_valid]
-    return skills_valid, vecs_arr, names_valid
-
+    vecs_arr = np.stack(vecs, axis=0).astype(np.float32)
+    return skills[:len(vecs)], vecs_arr, names
 
 def nearest_skill_by_text(text, top_k=3, threshold=0.65):
     """
-    Given a text (JD sentence or resume bullet), find nearest canonical skills by precomputed embeddings.
-    Returns list of tuples: [(skill_obj, similarity), ...] filtered by threshold.
+    Use the lazy model + precomputed skill embeddings.
     """
-    if not EMBEDDING_MODEL:
+    model = get_embedding_model()
+    if model is None:
         return []
-    emb = EMBEDDING_MODEL.encode([text], convert_to_numpy=True)
-    skills, skill_vecs, names = _load_skill_embeddings()
+    # embed the text
+    emb = embed_texts([text])
+    if emb is None:
+        return []
+    # load skill embeddings and validate dimension
+    skills, skill_vecs, names = _load_skill_embeddings(expected_dim=model.get_sentence_embedding_dimension())
     if skill_vecs is None or skill_vecs.size == 0:
         return []
-    a = emb
-    b = skill_vecs
-    a_norm = a / np.linalg.norm(a, axis=1, keepdims=True)
-    b_norm = b / np.linalg.norm(b, axis=1, keepdims=True)
+    # normalize and compute sims
+    a = emb.astype(np.float32)
+    b = skill_vecs.astype(np.float32)
+    a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
+    b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-8)
     sims = (a_norm @ b_norm.T)[0]
     idx = np.argsort(-sims)[:top_k]
     results = []
@@ -1404,9 +1878,13 @@ def nearest_skill_by_text(text, top_k=3, threshold=0.65):
             results.append((skills[i], sim))
     return results
 
+_GENERIC_SKILL_TOKENS = {
+    'relevant', 'relevance', 'qualification', 'qualifications', 'practical', 'computer', 'science',
+    'experience', 'skills', 'summary', 'responsibilities', 'responsibility', 'requirements', 'preferred'
+}
+
 
 # common short acronyms we want uppercase
-_ACRONYM_SET = {"aws", "gcp", "sql", "html", "css", "api", "ml", "nlp", "ci", "cd", "cli", "os", "ios", "android"}
 
 # blacklist phrases or tokens that are not skills
 _SKILL_STOP_PATTERNS = [
@@ -1417,18 +1895,12 @@ _SKILL_STOP_PATTERNS = [
     r"relevant technical field", r"experience with the", r"knowledge of the"
 ]
 _SKILL_STOP_RE = re.compile("|".join(_SKILL_STOP_PATTERNS), flags=re.I)
-
-# words that are not helpful as skills by themselves
+_ACRONYM_SET = {"aws", "gcp", "sql", "html", "css", "api", "ml", "nlp", "ci", "cd", "cli", "os", "ios", "android"}
 _SHORT_STOPWORDS = {"and", "or", "the", "with", "in", "on", "for", "of", "to", "experience", "knowledge"}
-
-# delimiters to split multi-skill tokens
 _SPLIT_DELIM_RE = re.compile(r'[,/;•\n\|]+')
-
-# detect languages / tech tokens that should preserve special chars (C++, C#, .NET)
+_PARENS_RE = re.compile(r'\((.*?)\)')
 _PRESERVE_PATTERN = re.compile(r'^(c\+\+|c#|\.net|node\.js|nodejs|node|js|javascript|typescript|ts|java|python|go(lang)?|golang|rust|kotlin|swift)$', flags=re.I)
 
-# detect things that look like "X (Y, Z)" or "X: Y, Z" while splitting
-_PARENS_RE = re.compile(r'\((.*?)\)')
 
 def _is_acronym(word):
     w = re.sub(r'[^a-zA-Z0-9]', '', word).lower()
@@ -1444,80 +1916,45 @@ def _clean_whitespace_and_punct(s):
     return s
 
 def _normalize_token(tok):
-    """
-    Normalize a single token heuristically.
-    Returns normalized token or None if token should be discarded.
-    """
     if not tok:
         return None
     t = tok.strip()
-
     # drop if contains stop phrases
     if _SKILL_STOP_RE.search(t):
         return None
-
-    # often tokens are full sentences; drop long natural sentences
-    if len(t) > 120 and t.count(' ') > 20:
-        return None
-
     # remove stray leading bullets / punctuation
     t = _clean_whitespace_and_punct(t)
-
-    # remove trailing explanatory clauses like "e.g." or "such as"
+    # remove explanatory trailing clause
     t = re.sub(r'(?i)\b(e\.g\.|eg:|for example:|such as:|such as)\b.*$', '', t).strip()
-
-    # split parenthesis content into separate tokens if present
-    # but only return current token; the splitter will handle inner ones
-    # remove stray parentheses wrappers
     if t.startswith('(') and t.endswith(')'):
         t = t[1:-1].strip()
-
-    # remove leading phrases "experience in", "familiar with"
     t = re.sub(r'^(experience in|experience with|familiar with|knowledge of|proficient in|proficiency in)\s+', '', t, flags=re.I).strip()
-
-    # filter out degree-like phrases
     if re.search(r'\b(degree|bachelor|masters|phd|university|graduat(e|ing))\b', t, flags=re.I):
         return None
-
-    # if it still looks like a sentence (many words and verbs), drop it
     if len(t.split()) > 8:
-        # allow medium-length hyphenated tech names, but drop long sentences
         return None
-
-    # preserve exact known forms first (C++, C#, .NET)
+    if t.lower() in _GENERIC_SKILL_TOKENS:
+        return None
     m = re.match(r'^(c\+\+|c#|\.net)$', t, flags=re.I)
     if m:
         normalized = m.group(1)
-        # standard casing
         if normalized.lower() == 'c++':
             return 'C++'
         if normalized.lower() == 'c#':
             return 'C#'
         return '.NET'
-
-    # normalize common js/node variants heuristically
     lower = t.lower()
-
-    # if token is an acronym or short uppercase-like -> uppercase it
     if _is_acronym(t):
         return t.upper()
-
-    # token contains dots or slashes (e.g., node.js) -> preserve punctuation and reasonable case
     if re.search(r'[._]', t):
-        # normalize node.js / NodeJS variants
         if re.match(r'node(\.|js|js$)', lower):
             return 'Node.js'
         if re.match(r'^\.?net$', lower) or lower == '.net':
             return '.NET'
-        # keep token but strip surrounding punctuation
         t2 = re.sub(r'^[\W_]+|[\W_]+$', '', t)
         return t2 if len(t2) <= 60 else None
-
-    # short tokens that are likely languages/tech; capitalize appropriately
     if re.match(r'^[a-z0-9\+\#\-]+$', t, flags=re.I):
-        # keep known language shapes like "python", "javascript", "java", "golang", "rust"
         if re.match(_PRESERVE_PATTERN, t):
-            # special-case a few to conventional display names
             low = t.lower()
             if low in ('js', 'javascript'):
                 return 'JavaScript'
@@ -1535,61 +1972,42 @@ def _normalize_token(tok):
                 return 'Node.js'
             if low in ('sql',):
                 return 'SQL'
-            # default to title-case if not acronym-like
             return t.capitalize()
-
-        # if looks like an acronym (aws, gcp, sql), uppercase
         if len(t) <= 4 and t.islower() and t in _ACRONYM_SET:
             return t.upper()
-
-        # else capitalize (python -> Python)
         return t.capitalize()
-
-    # multi-word token: title-case it but keep known all-caps pieces
     parts = re.split(r'[\s\-_]+', t)
     normalized_parts = []
     for p in parts:
         if _is_acronym(p):
             normalized_parts.append(p.upper())
         else:
-            # preserve camelCase or PascalCase words if present
             if re.search(r'[A-Z][a-z]', p):
                 normalized_parts.append(p)
             else:
                 normalized_parts.append(p.capitalize())
     normalized = " ".join(normalized_parts).strip()
-
-    # final sanity checks
     if len(normalized) == 0 or len(normalized) > 80:
         return None
-
-    # remove trailing stray punctuation
     normalized = re.sub(r'[,:;]+$', '', normalized)
+    if normalized.lower() in _GENERIC_SKILL_TOKENS:
+        return None
     return normalized
 
+
 def auto_normalize_skills(raw_skill_candidates):
-    """
-    raw_skill_candidates: list of strings (each string may contain multiple skills or be a sentence)
-    returns: list of normalized skill strings, deduplicated (preserving order)
-    """
     if not raw_skill_candidates:
         return []
-
     seen = set()
     out = []
-
     for item in raw_skill_candidates:
         if not item:
             continue
-        # first split on major delimiters
         pieces = re.split(_SPLIT_DELIM_RE, item)
-        # also split out parentheses contents (e.g., "languages (Java, Python)") and include them
         parens = _PARENS_RE.findall(item)
         if parens:
             for p in parens:
                 pieces.extend(re.split(_SPLIT_DELIM_RE, p))
-
-        # further split on "and" if short lists like "Java and Python"
         expanded = []
         for p in pieces:
             if p and re.search(r'\band\b', p, flags=re.I) and len(p.split(',')) == 1 and len(p.split()) <= 6:
@@ -1597,14 +2015,11 @@ def auto_normalize_skills(raw_skill_candidates):
                     expanded.append(sub)
             else:
                 expanded.append(p)
-
         for piece in expanded:
             p = piece.strip()
             if not p:
                 continue
-            # remove leading filler like "experience:" or bullet markers
             p = re.sub(r'^\s*[:\-\u2022\*]+\s*', '', p)
-            # normalize token
             norm = _normalize_token(p)
             if not norm:
                 continue
@@ -1612,5 +2027,4 @@ def auto_normalize_skills(raw_skill_candidates):
             if nk not in seen:
                 seen.add(nk)
                 out.append(norm)
-
     return out
