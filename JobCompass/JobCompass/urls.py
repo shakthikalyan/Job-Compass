@@ -25,19 +25,19 @@ urlpatterns = [
     path('resume/<uuid:resume_id>/', views.resume_detail, name='resume_detail'),
     path('job/<uuid:job_id>/', views.job_detail, name='job_detail'),
     path('nl_query/', views.nl_query, name='nl_query'),
-    path('analyze/', views.analyze_job_fit, name='analyze_job_fit'),
 
-    #testing
-    # path('analyze/quick_resume/', views.analyze_and_show_resume, name='analyze_and_show_resume'),
-    path('analyze/quick_job/', views.analyze_and_show_job, name='analyze_and_show_job'),
+    
+    path('analyze/', views.analyze_job_fit, name='analyze_job_fit'),
+    path('analyze/loading/', views.analyze_loading, name='analyze_loading'),
+    path('analyze/start/', views.analyze_start_background, name='analyze_start_background'),
+    path('analyze/status/', views.analyze_status, name='analyze_status'),
+    path('analyze/result-redirect/', views.analyze_result_redirect, name='analyze_result_redirect'),
+    path('match/<int:match_id>/', views.show_match_result, name='show_match_result'),
+    path('analyze/process/', views.analyze_process, name='analyze_process'),
+
+
+    
+    path('analyze/quick_resume/', views.analyze_and_show_resume, name='analyze_and_show_resume'),
     path('analyze/job/json/', views.analyze_job_json, name='analyze_job_json'),
     path('analyze/job/json/<uuid:job_id>/', views.analyze_job_json, name='analyze_job_json_by_id'),
-
-
-    #need changes
-    path('match/<uuid:resume_id>/<uuid:job_id>/', views.compute_match, name='compute_match'),
-    path('gaps/<int:match_id>/', views.gaps_view, name='gaps'),
-    path('recommendation/<int:match_id>/', views.recommendation_view, name='recommendation'),
-
 ]
-

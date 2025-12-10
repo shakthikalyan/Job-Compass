@@ -1,0 +1,222 @@
+{% extends "base.html" %}
+{% block content %}
+<div class="min-h-screen bg-gradient-to-br from-indigo-50 via-white to-cyan-50 flex items-center justify-center px-4">
+  <div class="max-w-4xl w-full">
+    <div class="text-center mb-12">
+      <div class="inline-flex items-center justify-center w-20 h-20 rounded-full bg-gradient-to-r from-indigo-500 to-cyan-400 mb-6 animate-pulse">
+        <svg class="w-10 h-10 text-white animate-spin" fill="none" viewBox="0 0 24 24">
+          <circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle>
+          <path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+        </svg>
+      </div>
+      <h1 class="text-3xl font-bold text-slate-900 mb-2">Analyzing Your Profile</h1>
+      <p class="text-slate-600">Please wait while we process your information...</p>
+    </div>
+
+    <div class="bg-white rounded-2xl shadow-xl p-8 md:p-12">
+      <div class="mb-12">
+        <h2 class="text-2xl font-bold text-slate-900 mb-6">Your Score</h2>
+        <div class="flex items-center justify-center mb-8">
+          <div class="relative w-48 h-48">
+            <svg class="transform -rotate-90 w-48 h-48">
+              <circle cx="96" cy="96" r="88" stroke="#e2e8f0" stroke-width="12" fill="none" />
+              <circle id="progress-circle" cx="96" cy="96" r="88" stroke="url(#gradient)" stroke-width="12" fill="none" 
+                      stroke-linecap="round" stroke-dasharray="552.92" stroke-dashoffset="552.92" 
+                      class="transition-all duration-500 ease-out" />
+              <defs>
+                <linearGradient id="gradient" x1="0%" y1="0%" x2="100%" y2="0%">
+                  <stop offset="0%" style="stop-color:#6366f1;stop-opacity:1" />
+                  <stop offset="100%" style="stop-color:#06b6d4;stop-opacity:1" />
+                </linearGradient>
+              </defs>
+            </svg>
+            <div class="absolute inset-0 flex items-center justify-center">
+              <div class="text-center">
+                <div id="score-text" class="text-2xl font-bold text-slate-900">--%</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="grid grid-cols-2 md:grid-cols-4 gap-4 mb-8">
+          <div class="p-4 rounded-lg bg-slate-50">
+            <div class="h-3 w-20 bg-slate-200 rounded animate-pulse mb-2"></div>
+            <div class="h-4 w-12 bg-slate-300 rounded animate-pulse"></div>
+          </div>
+          <div class="p-4 rounded-lg bg-slate-50">
+            <div class="h-3 w-20 bg-slate-200 rounded animate-pulse mb-2"></div>
+            <div class="h-4 w-12 bg-slate-300 rounded animate-pulse"></div>
+          </div>
+          <div class="p-4 rounded-lg bg-slate-50">
+            <div class="h-3 w-20 bg-slate-200 rounded animate-pulse mb-2"></div>
+            <div class="h-4 w-12 bg-slate-300 rounded animate-pulse"></div>
+          </div>
+          <div class="p-4 rounded-lg bg-slate-50">
+            <div class="h-3 w-20 bg-slate-200 rounded animate-pulse mb-2"></div>
+            <div class="h-4 w-12 bg-slate-300 rounded animate-pulse"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="space-y-4">
+        <div id="step-1" class="flex items-start gap-4 p-4 rounded-lg bg-indigo-50 border-2 border-indigo-200 transition-all">
+          <div class="flex-shrink-0 w-8 h-8 rounded-full bg-indigo-600 flex items-center justify-center">
+            <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+            </svg>
+          </div>
+          <div class="flex-1">
+            <h3 class="font-semibold text-slate-900">Parsing your resume</h3>
+            <p class="text-sm text-slate-600 mt-1">Extracting skills, experience, and projects</p>
+          </div>
+        </div>
+
+        <div id="step-2" class="flex items-start gap-4 p-4 rounded-lg bg-slate-50 border-2 border-slate-200 transition-all">
+          <div class="flex-shrink-0 w-8 h-8 rounded-full bg-slate-300 flex items-center justify-center">
+            <div class="w-4 h-4 border-2 border-slate-500 border-t-transparent rounded-full animate-spin"></div>
+          </div>
+          <div class="flex-1">
+            <h3 class="font-semibold text-slate-900">Analyzing your experience</h3>
+            <p class="text-sm text-slate-600 mt-1">Evaluating your background and qualifications</p>
+          </div>
+        </div>
+
+        <div id="step-3" class="flex items-start gap-4 p-4 rounded-lg bg-slate-50 border-2 border-slate-200 transition-all">
+          <div class="flex-shrink-0 w-8 h-8 rounded-full bg-slate-300 flex items-center justify-center">
+            <div class="w-2 h-2 bg-slate-500 rounded-full"></div>
+          </div>
+          <div class="flex-1">
+            <h3 class="font-semibold text-slate-600">Extracting your skills</h3>
+            <p class="text-sm text-slate-500 mt-1">Identifying technical and soft skills</p>
+          </div>
+        </div>
+
+        <div id="step-4" class="flex items-start gap-4 p-4 rounded-lg bg-slate-50 border-2 border-slate-200 transition-all">
+          <div class="flex-shrink-0 w-8 h-8 rounded-full bg-slate-300 flex items-center justify-center">
+            <div class="w-2 h-2 bg-slate-500 rounded-full"></div>
+          </div>
+          <div class="flex-1">
+            <h3 class="font-semibold text-slate-600">Generating recommendations</h3>
+            <p class="text-sm text-slate-500 mt-1">Creating personalized career advice</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+function getCookie(name) {
+  let cookieValue = null;
+  if (document.cookie && document.cookie !== '') {
+    const cookies = document.cookie.split(';');
+    for (let i = 0; i < cookies.length; i++) {
+      const cookie = cookies[i].trim();
+      if (cookie.substring(0, name.length + 1) === (name + '=')) {
+        cookieValue = decodeURIComponent(cookie.substring(name.length + 1));
+        break;
+      }
+    }
+  }
+  return cookieValue;
+}
+
+const startUrl = "{% url 'analyze_start_background' %}";
+const statusUrl = "{% url 'analyze_status' %}";
+const resultRedirect = "{% url 'analyze_result_redirect' %}";
+
+const circumference = 552.92;
+const circle = document.getElementById('progress-circle');
+const scoreText = document.getElementById('score-text');
+
+function setCircleProgress(pct) {
+  const offset = circumference - (pct / 100) * circumference;
+  if (circle) circle.style.strokeDashoffset = offset;
+  if (scoreText) scoreText.textContent = `${Math.round(pct)}%`;
+}
+
+function completeStepUI(stepNum) {
+  const step = document.getElementById(`step-${stepNum}`);
+  if (!step) return;
+  step.classList.remove('bg-slate-50', 'border-slate-200');
+  step.classList.add('bg-indigo-50', 'border-indigo-200');
+  const iconContainer = step.querySelector('.w-8.h-8');
+  if (iconContainer) {
+    iconContainer.classList.remove('bg-slate-300');
+    iconContainer.classList.add('bg-indigo-600');
+    iconContainer.innerHTML = `
+      <svg class="w-5 h-5 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M5 13l4 4L19 7"></path>
+      </svg>
+    `;
+  }
+  const heading = step.querySelector('h3');
+  const description = step.querySelector('p');
+  if (heading) {
+    heading.classList.remove('text-slate-600');
+    heading.classList.add('text-slate-900');
+  }
+  if (description) {
+    description.classList.remove('text-slate-500');
+    description.classList.add('text-slate-600');
+  }
+}
+
+function startBackground() {
+  fetch(startUrl, {
+    method: 'POST',
+    headers: {
+      'X-CSRFToken': getCookie('csrftoken'),
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify({})
+  }).then(r => r.json())
+    .then(res => {
+      pollStatus();
+    })
+    .catch(err => {
+      console.error('start background failed', err);
+      window.location.href = "{% url 'analyze_job_fit' %}";
+    });
+}
+
+let pollHandle = null;
+function pollStatus() {
+  if (pollHandle) clearInterval(pollHandle);
+  pollHandle = setInterval(() => {
+    fetch(statusUrl)
+      .then(r => r.json())
+      .then(s => {
+        const pct = s.progress || 0;
+        setCircleProgress(pct);
+
+        if (s.steps) {
+          if (s.steps.match && s.steps.match.done) completeStepUI(2);
+          if (s.steps.gaps && s.steps.gaps.done) completeStepUI(3);
+          if (s.steps.recommendation && s.steps.recommendation.done) completeStepUI(4);
+          if (s.steps.match && s.steps.match.done && s.steps.gaps && s.steps.gaps.done) {
+            completeStepUI(1);
+          }
+        }
+
+        if (s.status === 'done') {
+          clearInterval(pollHandle);
+          window.location.href = resultRedirect;
+        } else if (s.status === 'error') {
+          clearInterval(pollHandle);
+          alert('Analysis failed: ' + (s.error || 'unknown error'));
+          window.location.href = "{% url 'analyze_job_fit' %}";
+        }
+      })
+      .catch(err => {
+        console.error('status poll error', err);
+      });
+  }, 400);
+}
+
+window.addEventListener('DOMContentLoaded', () => {
+  setCircleProgress(0);
+  startBackground();
+});
+</script>
+{% endblock %}
