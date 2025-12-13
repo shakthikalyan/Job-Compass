@@ -1,0 +1,10 @@
+django
+pyplumber
+requests
+pdfminer
+jsonfield
+dotenv
+spacy[transformers]
+torch
+sentence-transformers
+openpyxl

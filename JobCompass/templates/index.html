@@ -31,7 +31,7 @@
         </a>
       </div>
 
-      <div class="mt-8 flex items-center justify-center gap-6 text-sm text-slate-500">
+      {% comment %} <div class="mt-8 flex items-center justify-center gap-6 text-sm text-slate-500">
         {# Safe rendering for total resumes: prefer stats if present, otherwise fallback to resumes|length #}
         {% if stats.total_resumes is defined %}
           <div><strong class="text-slate-800">{{ stats.total_resumes }}</strong> Job Matches Analyzed</div>
@@ -47,10 +47,10 @@
           <div><strong class="text-slate-800">{{ jobs|length }}</strong> Career decisions guided</div>
         {% endif %}
 
-        {% comment %} <div>•</div>
+        <div>•</div>
 
-        <div><strong class="text-slate-800">{{ stats.avg_match_score|default:"—" }}</strong> avg match</div> {% endcomment %}
-      </div>
+        <div><strong class="text-slate-800">{{ stats.avg_match_score|default:"—" }}</strong> avg match</div> 
+      </div> {% endcomment %}
     </div>
   </div>
 </section>
