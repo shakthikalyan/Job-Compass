@@ -29,9 +29,9 @@
         <div class="absolute inset-0 flex items-center justify-center">
           <div class="text-center">
             <div class="text-6xl font-bold bg-gradient-to-r from-indigo-600 to-cyan-500 bg-clip-text text-transparent mb-2">
-              {{ match_score_display }}
+              {{ match_score_display }}/10 
             </div>
-            <div class="text-xl font-semibold text-slate-700">{{ match.rating }}</div>
+            {% comment %} <div class="text-xl font-semibold text-slate-700">{{ match.rating }}</div> {% endcomment %}
           </div>
         </div>
       </div>
@@ -83,10 +83,10 @@
                 <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 21a4 4 0 01-4-4V5a2 2 0 012-2h4a2 2 0 012 2v12a4 4 0 01-4 4zm0 0h12a2 2 0 002-2v-4a2 2 0 00-2-2h-2.343M11 7.343l1.657-1.657a2 2 0 012.828 0l2.829 2.829a2 2 0 010 2.828l-8.486 8.485M7 17h.01"></path>
               </svg>
             </div>
-            <div class="text-sm font-medium text-emerald-700">PROJECTS</div>
+            <div class="text-sm font-medium text-emerald-700">JOB FIT</div>
           </div>
-          <div class="text-4xl font-bold text-emerald-900">{{ match_result.breakdown.projects|length }}</div>
-          <div class="text-sm text-emerald-600 mt-1">Relevant projects</div>
+          <div class="text-4xl font-bold text-emerald-900">{{ match.rating }}</div>
+          
         </div>
       </div>
     </div>
@@ -382,9 +382,7 @@
       <div class="flex-1">
         <div class="flex items-center gap-3 mb-3">
           <h3 class="text-2xl font-bold">Recommended Action</h3>
-          <span class="px-3 py-1 bg-white/30 backdrop-blur-sm rounded-full text-sm font-bold">
-            {{ recommendation.kind|upper }} PRIORITY
-          </span>
+          
         </div>
         <p class="text-lg text-white/95 leading-relaxed">{{ recommendation.text }}</p>
       </div>

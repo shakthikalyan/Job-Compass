@@ -1,5 +1,3 @@
-# App/utils.py
-# spaCy-first utilities for Career Compass (HF fallback removed)
 import re
 import os
 import json
@@ -8,8 +6,11 @@ import logging
 import numpy as np
 from functools import lru_cache
 from django.db.models import Q
-import requests
-from requests.exceptions import RequestException
+from typing import Dict,Any,List
+
+from App import ai_client
+
+
 
 log = logging.getLogger(__name__)
 
@@ -36,7 +37,6 @@ try:
 except Exception:
     pdfplumber = None
 
-# --- spaCy lazy loader (transformer preferred) ---
 _spacy_nlp = None
 def _load_spacy_model(prefer_trf=True):
     global _spacy_nlp
@@ -67,14 +67,30 @@ def _load_spacy_model(prefer_trf=True):
         _spacy_nlp = None
         return None
 
-# --- Constants & helpers (unchanged from your previous version) ---
+
+# ---------------- Constants (preserved) ----------------
 EMBEDDING_MODEL = os.getenv("SENTENCE_TRANSFORMER_MODEL", "all-MiniLM-L6-v2")
 SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", 0.65))
 
 COMMON_SOFT_SKILLS = [
     "communication", "teamwork", "leadership", "problem solving", "adaptability",
     "time management", "collaboration", "presentation", "mentoring", "project management",
+    "critical thinking", "research", "empathy", "creativity", "work ethic", "conflict resolution",
+    "decision making", "interpersonal skills", "organization", "attention to detail",
+    "flexibility", "active listening", "negotiation", "stress management", "public speaking",
+    "customer service", "coaching", "networking", "strategic planning", "multitasking", "motivation",
+    "team leadership", "innovation", "analytical thinking", "dependability", "patience", "positivity",
+    "self-motivation", "collaborative problem solving",
 ]
+
+LLM_SYSTEM_NO_THINK = (
+    "You are an expert career coach and resume evaluator.\n"
+    "Do NOT reveal chain-of-thought, reasoning steps, or analysis.\n"
+    "Do NOT include <think> tags.\n"
+    "Respond ONLY with valid JSON that matches the requested schema.\n"
+    "If the output is not valid JSON, it is invalid."
+)
+
 
 SECTION_HEADINGS = [
     r'(?i)experience', r'(?i)work experience', r'(?i)professional experience',
@@ -99,7 +115,7 @@ _GENERIC_SKILL_TOKENS = {
     'experience', 'skills', 'summary', 'responsibilities',
 }
 
-# ---------- file to text ----------
+# ---------- file to text ---------- (unchanged)
 def simple_text_from_file(file_obj):
     try:
         file_obj.seek(0)
@@ -155,24 +171,17 @@ def simple_text_from_file(file_obj):
     return _preprocess_extracted_text(text)
 
 def _preprocess_extracted_text(text):
-    """
-    Conservative preprocessing to fix common run-on and camel-case artifacts from PDF extraction.
-    """
     if not text:
         return ""
-    # Insert spaces for lower->Upper transitions that likely indicate concatenation:
     text = re.sub(r'([a-z])([A-Z][a-z])', r'\1 \2', text)
-    # Insert spaces between letters+digits and digits+letters
     text = re.sub(r'([a-zA-Z])([0-9])', r'\1 \2', text)
     text = re.sub(r'([0-9])([a-zA-Z])', r'\1 \2', text)
-    # collapse excessive newlines
     text = re.sub(r'\s+\n', '\n', text)
     text = re.sub(r'\n{3,}', '\n\n', text)
-    # strip non printable
     text = re.sub(r'[^\x09\x0A\x0D\x20-\x7E\u00A0-\u024F\n]', ' ', text)
     return text.strip()
 
-# ---------- normalization helpers ----------
+# ---------- normalization helpers ---------- (unchanged)
 def _clean_whitespace_and_punct(s):
     s = s or ""
     s = s.strip()
@@ -243,7 +252,21 @@ def _normalize_token(tok):
         return None
     return normalized
 
+# ---------- preserve common multi-word phrases & improved splitting ----------
+COMMON_MULTI_PHRASES = set([
+    'industrial design', 'product design', 'colour theory', 'color theory',
+    'user research', 'design systems', 'information architecture', 'human interface',
+    'user flows', 'wire framing', 'wireframing', 'visual design'
+])
+
+
+
 def auto_normalize_skills(raw_skill_candidates):
+    """
+    Normalizer with reduced over-splitting:
+    - preserves common multi-word phrases
+    - avoids producing single-word fragments from complex sentences
+    """
     if not raw_skill_candidates:
         return []
     seen = set()
@@ -251,6 +274,9 @@ def auto_normalize_skills(raw_skill_candidates):
     for item in raw_skill_candidates:
         if not item:
             continue
+        # If the candidate is long and looks like a grouped list "A, B or C", try to split more conservatively
+        # (but keep multi-word nouns intact)
+        # First break by main delimiters (commas/semicolon/newline) but then recombine adjacent tokens if they form a known phrase
         pieces = re.split(_SPLIT_DELIM_RE, item)
         parens = _PARENS_RE.findall(item)
         if parens:
@@ -258,26 +284,70 @@ def auto_normalize_skills(raw_skill_candidates):
                 pieces.extend(re.split(_SPLIT_DELIM_RE, p))
         expanded = []
         for p in pieces:
-            if p and re.search(r'\band\b', p, flags=re.I) and len(p.split(',')) == 1 and len(p.split()) <= 6:
+            if p and re.search(r'\band\b', p, flags=re.I) and len(p.split(',')) == 1 and len(p.split()) <= 8:
                 for sub in re.split(r'\band\b', p, flags=re.I):
                     expanded.append(sub)
             else:
                 expanded.append(p)
+        # Post-process each piece: attempt to keep two-word noun phrases intact if known
         for piece in expanded:
             p = (piece or "").strip()
             if not p:
                 continue
             p = re.sub(r'^\s*[:\-\u2022\*]+\s*', '', p)
-            norm = _normalize_token(p)
+            # guard: if piece contains 'or' with 'or a related field' we keep the preceding phrase
+            if re.search(r'\bor a related field\b', p, flags=re.I):
+                # try to pick the noun phrase preceding 'or a related field'
+                m = re.search(r'(?i)([A-Za-z \-]+?)\s*(?:,|\s)?\s*or a related field', p)
+                if m:
+                    cand = m.group(1).strip()
+                    norm = _normalize_token(cand)
+                    if norm:
+                        nk = norm.lower()
+                        if nk not in seen:
+                            seen.add(nk); out.append(norm)
+                        continue
+            # if piece is a multi-word phrase and matches common list, preserve whole phrase
+            cleaned = re.sub(r'\s+', ' ', p).strip()
+            low = cleaned.lower()
+            if low in COMMON_MULTI_PHRASES:
+                norm = _normalize_token(cleaned)
+                if norm:
+                    nk = norm.lower()
+                    if nk not in seen:
+                        seen.add(nk); out.append(norm)
+                    continue
+            # otherwise normalize normally, but avoid single-word fragments from long sentences
+            norm = _normalize_token(cleaned)
             if not norm:
+                # fallback: if cleaned has >2 words, attempt to extract noun-noun bigrams
+                words = [w for w in re.split(r'[\s\-_]+', cleaned) if w and len(w) > 1]
+                if len(words) >= 2:
+                    # try producing two-word candidates from adjacent words and keep ones matching common phrases
+                    for i in range(len(words)-1):
+                        cand = f"{words[i]} {words[i+1]}"
+                        if cand.lower() in COMMON_MULTI_PHRASES:
+                            nn = _normalize_token(cand)
+                            if nn and nn.lower() not in seen:
+                                seen.add(nn.lower()); out.append(nn)
                 continue
             nk = norm.lower()
             if nk not in seen:
-                seen.add(nk)
-                out.append(norm)
+                seen.add(nk); out.append(norm)
+    return out
+def _dedupe_preserve_order(lst):
+    seen = set(); out = []
+    for x in lst:
+        if not x: continue
+        k = x.lower().strip()
+        if k in seen: continue
+        seen.add(k); out.append(x)
     return out
 
-# ---------- KB lookup ----------
+# ---------- ----------
+
+
+
 def normalize_token(tok):
     return (tok or "").lower().strip()
 
@@ -354,11 +424,10 @@ def _lines_to_skills(content, strict=False):
             continue
         if token.lower() in ('skills', 'experience', 'education', 'projects', 'tech stack', 'techstack', 'tech:'):
             continue
-        if _looks_like_sentence(token):
+        # protect multi-word degree phrases
+        if strict and len(token.split()) > 6:
             continue
-        if strict and len(token.split()) > 3:
-            continue
-        if len(token) < 2 or len(token) > 60:
+        if len(token) < 2 or len(token) > 200:
             continue
         tnorm = token.lower()
         if tnorm in seen:
@@ -367,7 +436,7 @@ def _lines_to_skills(content, strict=False):
         skills.append(token)
     return skills
 
-# ---------- contact extraction ----------
+# ---------- contact extraction (unchanged) ----------
 def _extract_contact_info(text):
     contact = {}
     em = re.search(r'([A-Za-z0-9.\-_+]+@[A-Za-z0-9\-_]+\.[A-Za-z0-9.\-_]+)', text)
@@ -389,12 +458,8 @@ def _extract_contact_info(text):
                 contact['name'] = lines[1]
     return contact
 
-# ---------- spaCy-backed NER (no HF fallback) ----------
+# ---------- spaCy-backed NER (unchanged) ----------
 def ner_extract_entities(text, max_orgs=6, max_persons=3):
-    """
-    Uses spaCy NER first (if available), then conservative regex heuristics.
-    Returns {'persons':[], 'orgs':[], 'dates':[], 'title_candidates':[]}
-    """
     persons = []
     orgs = []
     dates = []
@@ -404,7 +469,6 @@ def ner_extract_entities(text, max_orgs=6, max_persons=3):
     if nlp:
         try:
             doc = nlp(text)
-            # collect entities
             for ent in doc.ents:
                 lab = ent.label_.upper()
                 ent_text = ent.text.strip()
@@ -416,7 +480,6 @@ def ner_extract_entities(text, max_orgs=6, max_persons=3):
                     if ent_text not in orgs: orgs.append(ent_text)
                 elif lab in ("DATE", "TIME"):
                     if ent_text not in dates: dates.append(ent_text)
-            # noun chunk proximity for title candidates
             try:
                 chunks = list(doc.noun_chunks)
                 for i, chunk in enumerate(chunks):
@@ -434,7 +497,6 @@ def ner_extract_entities(text, max_orgs=6, max_persons=3):
         except Exception:
             log.debug("spaCy NER failed, falling back to regex heuristics", exc_info=True)
 
-    # Regex/heuristic fallback
     org_pattern = re.compile(
         r'([A-Z][A-Za-z0-9&\.\-]{2,}(?: (?:Ltd|LLP|Inc|Corp|Company|Solutions|Systems|Academy|College|Institute|Technologies|Tech|Lab|LLC|GmbH|Pvt|Private|Limited))?)'
     )
@@ -486,35 +548,781 @@ def ner_extract_entities(text, max_orgs=6, max_persons=3):
 
     return {"persons": persons[:max_persons], "orgs": orgs[:max_orgs], "dates": dates, "title_candidates": titles[:10]}
 
-# ---------- parsing pipeline (mostly unchanged) ----------
+# ---------- parsing pipeline (mostly preserved with enhancements) ----------
 def build_resume_prompt(raw_text):
     return {"task": "Parse resume into structured JSON", "input_text": raw_text or ""}
 
-def _split_sections_by_headings(text):
+
+def _split_sections_by_headings(text: str) -> Dict[str, str]:
+    if not text:
+        return {"body": ""}
+
     s_text = text.replace('\r', '\n')
+    # collapse repeated newlines to two to keep paragraphs
     s_text = re.sub(r'\n{2,}', '\n\n', s_text)
     lines = s_text.splitlines()
     indexes = []
     for i, line in enumerate(lines):
         clean = line.strip()
+        # match heading tokens: e.g., "Responsibilities:" or "Required skills"
         for h in SECTION_HEADINGS:
-            if re.fullmatch(h + r'[:\s]*', clean, flags=re.I):
+            # allow small variations and trailing colon or whitespace
+            if re.fullmatch(rf"{h}\b[:\s]*", clean, flags=re.I):
                 indexes.append((i, clean))
                 break
     if not indexes:
-        return {"body": s_text}
+        # no explicit headings - return whole text in 'body'
+        return {"body": s_text.strip()}
+
     sections = {}
     for idx, (line_idx, heading_line) in enumerate(indexes):
         start = line_idx + 1
         end = indexes[idx + 1][0] if idx + 1 < len(indexes) else len(lines)
         content = "\n".join(lines[start:end]).strip()
+        # normalize heading text (strip trailing colon/space)
         heading_norm = re.sub(r'[:\s]+$', '', heading_line).strip()
         sections[heading_norm] = content
     return sections
 
-# call_claude_parse and remaining functions adapted from your previous implementation,
-# using ner_extract_entities (spaCy-first) to post-process experience & contact.
-# (I kept your original logic intact and only replaced HF NER usage.)
+_JACCARD_HIGH = 0.5
+_JACCARD_MED = 0.25
+
+def _extract_keywords_from_phrase(phrase, max_terms=6):
+    if not phrase:
+        return []
+    txt = re.sub(r'[^A-Za-z0-9\+\#\.\s\-]', ' ', phrase)
+    parts = [p.strip().lower() for p in re.split(r'[\s\-]+', txt) if p.strip()]
+    parts = [p for p in parts if p not in _SHORT_STOPWORDS and len(p) > 1]
+    return parts[:max_terms]
+
+
+
+# Preferred embedding model (sentence-transformers wrapper)
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "BAAI/bge-large-en-v1.5")  # preferred
+EMBEDDING_FALLBACK = "all-MiniLM-L6-v2"
+SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", 0.65))
+
+# lazy holder
+_embedding_model = None
+_embedding_kind = None
+
+@lru_cache(maxsize=1)
+def get_embedding_model():
+    global _embedding_model, _embedding_kind
+    try:
+        from sentence_transformers import SentenceTransformer
+    except Exception as e:
+        log.exception("sentence_transformers not installed: %s", e)
+        return None
+
+    # try preferred BGE first
+    for candidate in (EMBEDDING_MODEL, EMBEDDING_FALLBACK):
+        try:
+            m = SentenceTransformer(candidate)
+            _embedding_model = m
+            _embedding_kind = "st"
+            log.info("Loaded embedding model: %s", candidate)
+            return ("st", m)
+        except Exception as exc:
+            log.debug("Failed to load SentenceTransformer '%s': %s", candidate, exc, exc_info=True)
+
+    log.warning("No sentence-transformers embedding model could be loaded.")
+    return None
+
+def embed_texts(texts):
+    """
+    Returns numpy.ndarray shape (N, D) or None on failure.
+    Uses the loaded sentence-transformers (BGE or fallback).
+    """
+    if texts is None:
+        return None
+    if isinstance(texts, str):
+        texts_list = [texts]
+    else:
+        texts_list = list(texts)
+
+    backend = get_embedding_model()
+    if not backend:
+        log.debug("embed_texts: no embedding backend loaded")
+        return None
+    kind, model = backend
+    try:
+        # SentenceTransformer: model.encode([...], convert_to_numpy=True)
+        try:
+            emb = model.encode(texts_list, convert_to_numpy=True, show_progress_bar=False)
+        except TypeError:
+            emb = model.encode(texts_list, show_progress_bar=False)
+        emb = np.asarray(emb, dtype=np.float32)
+       
+        norms = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-10
+        emb = emb / norms
+        return emb
+    except Exception as e:
+        log.exception("embed_texts failed: %s", e)
+        return None
+
+def cosine_sim(a, b):
+    if a is None or b is None:
+        return None
+    try:
+        model = get_embedding_model()
+        if util is not None and model is not None:
+            try:
+                return util.cos_sim(a, b).cpu().numpy()
+            except Exception:
+                pass
+        a = np.asarray(a, dtype=np.float32)
+        b = np.asarray(b, dtype=np.float32)
+        if a.ndim == 1: a = a.reshape(1, -1)
+        if b.ndim == 1: b = b.reshape(1, -1)
+        a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
+        b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-8)
+        return np.dot(a_norm, b_norm.T)
+    except Exception:
+        log.exception("cosine_sim fallback failed")
+        return None
+
+def is_equivalent(skill, candidate_skills):
+    s = (skill or "").strip()
+    if not s:
+        return False, 0.0
+    cand = [c for c in (candidate_skills or []) if c]
+    cand_norm = [normalize_token(c) for c in cand]
+
+    kb_skill, canonical, matched_syns = kb_lookup(skill)
+    if kb_skill:
+        variants = {normalize_token(canonical)}
+        for syn in (kb_skill.synonyms or []):
+            variants.add(normalize_token(syn))
+        for c in cand_norm:
+            if c in variants:
+                return True, 1.0
+        for c in cand_norm:
+            for v in variants:
+                if v in c or c in v:
+                    return True, 0.9
+
+    s_norm = normalize_token(s)
+    for key, alts in EQUIVALENCES.items():
+        if s_norm == normalize_token(key):
+            for alt in alts:
+                if normalize_token(alt) in cand_norm:
+                    return True, 0.9
+
+    for c in cand_norm:
+        if s_norm in c or c in s_norm:
+            return True, 0.5
+
+    s_tokens = set(_extract_keywords_from_phrase(s))
+    best_overlap = 0.0
+    for c in cand:
+        c_tokens = set(_extract_keywords_from_phrase(c))
+        if not s_tokens or not c_tokens:
+            continue
+        inter = s_tokens & c_tokens
+        union = s_tokens | c_tokens
+        overlap = (len(inter) / len(union)) if union else 0
+        if overlap > best_overlap:
+            best_overlap = overlap
+    if best_overlap >= _JACCARD_HIGH:
+        return True, 0.6
+    if best_overlap >= _JACCARD_MED:
+        return True, 0.5
+
+    model = get_embedding_model()
+    try:
+        if model is not None and cand:
+            s_emb = embed_texts([s])
+            cand_emb = embed_texts(cand)
+            if s_emb is not None and cand_emb is not None:
+                sims = cosine_sim(s_emb, cand_emb)
+                if sims is not None and sims.size > 0:
+                    if float(sims.max()) >= SIM_THRESHOLD:
+                        return True, 0.85
+    except Exception:
+        log.debug("embedding fallback in is_equivalent failed", exc_info=True)
+
+    return False, 0.0
+
+
+import math
+if 'semantic_match_score' not in globals():
+    def semantic_match_score(resume_parsed, job_parsed):
+        """
+        Lightweight, faithful fallback of the original semantic_match_score.
+        Returns dict {score (0..10), rating, breakdown, raw_points}
+        """
+        # try to call original if still present under different name
+        if 'semantic_match_score' in globals() and globals()['semantic_match_score'] is not semantic_match_score:
+            return globals()['semantic_match_score'](resume_parsed, job_parsed)
+
+        # Defaults and constants
+        CRIT_WEIGHT = 0.50
+        BEN_WEIGHT = 0.10
+        EXP_WEIGHT = 0.15
+        PROJ_WEIGHT = 0.25
+        SIM_THRESHOLD = float(os.getenv("SIM_THRESHOLD", 0.65))
+
+        # Basic safe-get helpers
+        def _get_resume_skills(rp):
+            # collect raw lists from parsed resume
+            raw = []
+            raw += (rp.get('technical_skills') or [])
+            raw += (rp.get('soft_skills') or [])
+            # include short text cues from summary
+            summ = (rp.get('summary') or "")
+            if summ:
+                # extract obvious tool names from summary heuristically
+                for m in re.findall(r'\b(Adobe|Photoshop|Illustrator|InDesign|Figma|Sketch|XD|user research|colour theory|color theory|prototype|prototyping)\b', summ, flags=re.I):
+                    raw.append(m)
+            return list(raw)
+
+        def _normalize_list(xs):
+            return [x for x in xs if x]
+
+        # derive both raw and normalized forms — normalization is critical
+        resume_raw_skills = _get_resume_skills(resume_parsed or {})
+        # normalize & dedupe canonical tokens for matching
+        try:
+            resume_skills = _dedupe_preserve_order(auto_normalize_skills(resume_raw_skills))
+        except Exception:
+            # fallback: lowercase dedupe
+            resume_skills = list({(s or "").lower().strip(): s for s in resume_raw_skills}.values())
+
+
+        job_crit = _normalize_list(job_parsed.get('critical_skills') if isinstance(job_parsed, dict) else [])
+        job_ben = _normalize_list(job_parsed.get('beneficial_skills') if isinstance(job_parsed, dict) else [])
+
+        # short-circuit: if no job_crit, treat whole JD as a body of text and score with projects/exp
+        num_crit = max(1, len(job_crit))
+
+        # helper: compute credit for a single job skill using available functions if any
+        def compute_skill_credit(skill_text):
+            # 1) KB / exact match via is_equivalent if available
+            if not skill_text:
+                return 0.0, "0.00 (missing)"
+            # Normalize the job skill candidate (prefer multiword preservation)
+            try:
+                job_norms = auto_normalize_skills([skill_text])
+                job_skill = job_norms[0] if job_norms else skill_text.strip()
+            except Exception:
+                job_skill = skill_text.strip()
+
+            # 1) Knowledge base or exact canonical matching using normalized tokens
+            try:
+                if 'is_equivalent' in globals():
+                    matched, rule_score = is_equivalent(job_skill, resume_skills)
+                    if matched and rule_score >= 0.9:
+                        return 1.0, f"1.00 (exact rule {rule_score:.2f})"
+                    if matched and rule_score >= 0.5:
+                        return 0.8, f"0.8 (transferable {rule_score:.2f})"
+            except Exception:
+                pass
+
+
+            # 2) simple normalized containment fallback
+            low = (job_skill or "").lower().strip()
+            for r in resume_skills:
+                if not r: continue
+                rnorm = (r or "").lower().strip()
+                if low == rnorm:
+                    return 1.0, "1.00 (exact token)"
+                if low in rnorm or rnorm in low:
+                    return 0.8, "0.8 (substr)"
+
+
+            # 3) embedding semantic fallback if available
+            try:
+                model_tuple = None
+                if 'get_embedding_model' in globals():
+                    model_tuple = get_embedding_model()
+                if model_tuple:
+                    # build small embeddings and compare
+                    s_emb = None
+                    r_embs = None
+                    try:
+                        s_emb = embed_texts([skill_text])
+                        r_embs = embed_texts(resume_skills) if resume_skills else None
+                        if s_emb is not None and r_embs is not None:
+                            sims = cosine_sim(s_emb, r_embs)
+                            best = float(sims.max())
+                            if best >= SIM_THRESHOLD:
+                                return 1.0, f"1.00 (semantic {best:.2f})"
+                            if best >= SIM_THRESHOLD - 0.15:
+                                return 0.8, f"0.8 (partial sem {best:.2f})"
+                            if best >= SIM_THRESHOLD - 0.30:
+                                return 0.45, f"0.45 (weak sem {best:.2f})"
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+            # default missing
+            return 0.0, "0.00 (missing)"
+
+        weighted_sum = 0.0
+        breakdown = {"critical": {}, "beneficial": {}}
+
+        # critical loop
+        for s in job_crit:
+            credit, reason = compute_skill_credit(s)
+            contrib = (credit * CRIT_WEIGHT) / num_crit
+            weighted_sum += contrib
+            breakdown["critical"][s] = f"{credit:.2f} ({reason})"
+
+        # beneficial loop
+        num_ben = max(1, len(job_ben))
+        for b in job_ben:
+            credit, reason = compute_skill_credit(b)
+            contrib = (credit * BEN_WEIGHT) / num_ben
+            weighted_sum += contrib
+            breakdown["beneficial"][b] = f"{credit:.2f} ({reason})"
+
+        # Experience credit (naive fallback)
+        exp_credit = 0.0 
+        try:
+            years = None
+            # 1) If resume_parsed provided an explicit 'years' field use it
+            if isinstance(resume_parsed, dict):
+                if isinstance(resume_parsed.get('years'), (int, float)):
+                    years = int(resume_parsed.get('years'))
+            # 2) if not, infer from experience blocks count and text
+            exp_list = resume_parsed.get('experience') or []
+            if exp_list and isinstance(exp_list, list):
+                # if there are >=2 experience entries treat as mid/senior
+                if len(exp_list) >= 3:
+                    exp_credit = 1.0
+                elif len(exp_list) >= 1:
+                    # if any role contains 'design' or 'product' treat as relevant
+                    found_relevant = any(re.search(r'\b(product|design|ux|ui|industrial)\b', json.dumps(e, default=str), flags=re.I) for e in exp_list)
+                    exp_credit = 0.9 if found_relevant else 0.6
+            # 3) years extracted from summary/body text (fall back)
+            if years is None:
+                text_blob = " ".join(filter(None, [resume_parsed.get('summary',''), " ".join(resume_raw_skills)]))
+                m = re.search(r'(\d+)\+?\s+years?', text_blob)
+                if m:
+                    years = int(m.group(1))
+                    if years >= 5:
+                        exp_credit = max(exp_credit, 1.0)
+                    elif years >= 3:
+                        exp_credit = max(exp_credit, 0.9)
+                    else:
+                        exp_credit = max(exp_credit, 0.6)
+            # 4) if job explicitly asked for years_required use that threshold
+            req_years = job_parsed.get('years_required') if isinstance(job_parsed, dict) else None
+            if req_years:
+                if years and years >= req_years:
+                    exp_credit = max(exp_credit, 1.0)
+                elif years and years >= max(0, req_years - 1):
+                    exp_credit = max(exp_credit, 0.7)
+        except Exception:
+            exp_credit = 0.2
+
+        weighted_sum += exp_credit * EXP_WEIGHT
+
+        # Project credit (simple averaging)
+        proj_credit = 0.0
+        try:
+            projects = resume_parsed.get('projects') or []
+            if projects:
+                total_rel = 0.0
+                for p in projects:
+                    # project text
+                    ptxt = (p.get('description') or "") + " " + (p.get('title') or "")
+                    # token overlap with criticals
+                    overlap = 0
+                    for s in job_crit:
+                        if (s or "").lower() in ptxt.lower() or (ptxt.lower() in (s or "").lower()):
+                            overlap += 1
+                    token_score = min(1.0, overlap / max(1.0, len(job_crit)))
+                    # try semantic
+                    sem = 0.0
+                    try:
+                        embp = embed_texts([ptxt])
+                        embj = embed_texts(job_crit)
+                        if embp is not None and embj is not None:
+                            sims = cosine_sim(embj, embp)
+                            sem = float(sims.max())
+                    except Exception:
+                        sem = 0.0
+                    rel = max(token_score * 0.8, sem * 0.95)
+                    # small boost if measurable indicated
+                    if re.search(r'\b(reduce|increase|improve|%|percent|revenue|users|engagement)\b', ptxt, flags=re.I):
+                        rel += 0.05
+                    total_rel += min(1.0, rel)
+                proj_credit = (total_rel / len(projects))
+        except Exception:
+            proj_credit = 0.0
+
+        weighted_sum += proj_credit * PROJ_WEIGHT
+
+        # final clamp and scale
+        weighted_sum = max(0.0, min(1.0, weighted_sum))
+        final_score = int(round(weighted_sum * 10.0))
+        if final_score >= 8:
+            rating = "Strong"
+        elif final_score >= 6:
+            rating = "Moderate"
+        elif final_score >= 4:
+            rating = "Fair"
+        else:
+            rating = "Weak"
+
+        exp_label = "Unknown"
+        if exp_credit >= 0.9:
+            exp_label = "Experience Matched"
+        elif exp_credit >= 0.6:
+            exp_label = "Partial Experience"
+        else:
+            exp_label = "Experience Insufficient"
+
+        # Projects details
+        projects_info = {}
+        try:
+            proj_list = resume_parsed.get('projects') or []
+            projects_info = { p.get('name','Project')[:80]: f"rel:{round( ( (float(sum(1 for s in job_crit if (s or '').lower() in ((p.get('description') or '').lower() or p.get('title','').lower())) ) / max(1,len(job_crit))) ), 2)}" for p in proj_list }
+        except Exception:
+            projects_info = {}
+
+        return {
+            "score": final_score,
+            "rating": rating,
+            "breakdown": breakdown,
+            "raw_points": round(weighted_sum, 4),
+            "experience": exp_label,
+            "projects_count": len(resume_parsed.get('projects') or []),
+            "projects": projects_info
+        }
+
+def llm_suggest_for_gaps(resume_snippet, job_snippet, gaps):
+    """
+    Ask the LLM to generate suggestions / example bullets for a list of gaps.
+    We send one prompt covering all gaps (JSON output).
+    Returns a dict mapping skill -> suggestion dict.
+    """
+    if not gaps:
+        return {}
+
+    # Limit number of gaps sent to avoid tokens explosion
+    MAX_GAPS = 12
+    gaps_to_send = gaps[:MAX_GAPS]
+
+    # Build short context
+    prompt = {
+        "resume_skills": resume_snippet.get("skills", [])[:60],
+        "resume_projects": resume_snippet.get("projects", [])[:6],
+        "job_title": job_snippet.get("title", ""),
+        "job_critical": job_snippet.get("critical_skills", [])[:60],
+        "gaps": [{"skill": g["skill"], "type": g.get("type"), "importance": g.get("importance", 1.0)} for g in gaps_to_send]
+    }
+
+    # instruct LLM to return JSON
+    system = "You are a concise career coach. Return a JSON object mapping each gap skill to an object with keys: suggestion (1-2 sentences), example_bullets (list up to 2). Respond with only valid JSON."
+    user_text = "Context JSON:\n" + json.dumps(prompt, indent=2) + "\n\nProduce a JSON mapping each 'skill' -> {\"suggestion\":..., \"example_bullets\": [...]}."
+
+    resp = ai_client.call_llm(prompt=user_text, system=system, max_tokens=512, temperature=0.2)
+    text = resp.get("text", "")
+    if not text:
+        log.warning("LLM returned no text for gap suggestions, fallback to rule text.")
+        return {}
+
+    # Try to extract JSON from response robustly
+    try:
+        m = re.search(r'(\{[\s\S]*\})', text)
+        if m:
+            js = json.loads(m.group(1))
+            return js if isinstance(js, dict) else {}
+        # fallback - try evaluate if it's pure JSON list or dict
+        js = json.loads(text)
+        return js if isinstance(js, dict) else {}
+    except Exception as e:
+        log.exception("Failed to parse LLM JSON - returning empty suggestions: %s", e)
+        return {}
+
+def gap_analysis(resume_parsed, job_parsed, top_n=8):
+    resume_parsed = resume_parsed or {}
+    job_parsed = job_parsed or {}
+
+    # 1) collect resume and job skill sets
+    resume_raw = []
+    resume_raw += (resume_parsed.get('technical_skills') or [])
+    resume_raw += (resume_parsed.get('soft_skills') or [])
+    summary_text = (resume_parsed.get('summary') or "") or ""
+    if summary_text:
+        for m in re.findall(r'\b(Adobe|Photoshop|Illustrator|InDesign|Figma|Sketch|XD|user research|prototype|prototyping)\b', summary_text, flags=re.I):
+            resume_raw.append(m)
+
+    try:
+        resume_norm = _dedupe_preserve_order(auto_normalize_skills(resume_raw))
+    except Exception:
+        resume_norm = _dedupe_preserve_order([ (s or "").strip() for s in resume_raw ])
+
+    crit_raw = job_parsed.get('critical_skills') or []
+    ben_raw = job_parsed.get('beneficial_skills') or []
+    try:
+        crit_norm = _dedupe_preserve_order(auto_normalize_skills(crit_raw))
+    except Exception:
+        crit_norm = _dedupe_preserve_order([ (s or "").strip() for s in crit_raw ])
+    try:
+        ben_norm = _dedupe_preserve_order(auto_normalize_skills(ben_raw))
+    except Exception:
+        ben_norm = _dedupe_preserve_order([ (s or "").strip() for s in ben_raw ])
+
+    # lowercase resume tokens for cheap lookups
+    resume_skills_lower = [ (s or "").lower().strip() for s in resume_norm ]
+    resume_token_sets = [(r, set(re.findall(r'\w+', r))) for r in resume_skills_lower if r]
+
+    SIM = SIM_THRESHOLD
+
+    gaps = []
+    transferable_candidates = []
+
+    # Precompute embeddings once (resume and critical skills)
+    emb_resume = None
+    emb_crit = None
+    try:
+        if resume_norm:
+            emb_resume = embed_texts(resume_norm)   # shape (R, D)
+    except Exception:
+        emb_resume = None
+
+    try:
+        if crit_norm:
+            emb_crit = embed_texts(crit_norm)       # shape (C, D)
+    except Exception:
+        emb_crit = None
+
+    # 2) Evaluate each critical skill
+    for idx, s in enumerate(crit_norm):
+        s_norm = (s or "").strip()
+        if not s_norm:
+            continue
+
+        # a) exact match
+        if s_norm.lower() in resume_skills_lower:
+            continue
+
+        # b) KB / equivalences (fast)
+        try:
+            if 'is_equivalent' in globals():
+                matched, rule_score = is_equivalent(s_norm, resume_norm)
+                if matched and rule_score >= 0.9:
+                    continue
+                if matched and rule_score >= 0.5:
+                    gaps.append({
+                        "skill": s,
+                        "type": "transferable",
+                        "importance": 1.0,
+                        "suggestion": f"Related skill found via KB. Reframe a bullet to show {s}."
+                    })
+                    continue
+        except Exception:
+            pass
+
+        # c) token overlap quick check
+        tokens_s = set(re.findall(r'\w+', s_norm.lower()))
+        best_ov = 0.0
+        for r_text, tokens_r in resume_token_sets:
+            ov = len(tokens_s & tokens_r) / max(1, len(tokens_s | tokens_r))
+            if ov > best_ov:
+                best_ov = ov
+        if best_ov >= 0.5:
+            gaps.append({
+                "skill": s,
+                "type": "transferable",
+                "importance": 1.0,
+                "suggestion": f"Found related words by token-overlap (score {best_ov:.2f}). Highlight transferability."
+            })
+            continue
+        if best_ov >= 0.25:
+            gaps.append({
+                "skill": s,
+                "type": "transferable",
+                "importance": 0.8,
+                "suggestion": f"Partial token overlap (score {best_ov:.2f}). Clarify relevance in bullets."
+            })
+            continue
+
+        # d) embeddings semantic similarity (fast matrix op)
+        sem_handled = False
+        try:
+            if emb_crit is not None and emb_resume is not None:
+                sim_row = cosine_sim(emb_crit[idx:idx+1], emb_resume)   # shape (1, R)
+                if sim_row is not None:
+                    max_sim = float(sim_row.max())
+                    if max_sim >= SIM:
+                        sem_handled = True  # treat as matched
+                    elif max_sim >= (SIM - 0.15):
+                        gaps.append({
+                            "skill": s,
+                            "type": "transferable",
+                            "importance": 0.9,
+                            "suggestion": f"Related skill found semantically (sim {max_sim:.2f}). Emphasize similarity."
+                        })
+                        sem_handled = True
+        except Exception:
+            pass
+
+        if sem_handled:
+            continue
+
+        # otherwise missing
+        gaps.append({
+            "skill": s,
+            "type": "missing",
+            "importance": 1.0,
+            "suggestion": f"This role requires '{s}' but it isn't present in the resume."
+        })
+
+    # 3) Beneficial skills (lower importance)
+    for b_raw in ben_norm:
+        b_low = (b_raw or "").lower().strip()
+        matched = False
+        for r in resume_skills_lower:
+            if not r: continue
+            if b_low == r or b_low in r or r in b_low:
+                matched = True
+                break
+        if not matched:
+            gaps.append({
+                "skill": b_raw,
+                "type": "learnable",
+                "importance": 0.4,
+                "suggestion": f"Optional: learn or demonstrate '{b_raw}' with a short artifact or course."
+            })
+
+    # 4) Extras (resume-only strengths)
+    extra_skills = []
+    jd_tokens = set([x.lower().strip() for x in (crit_norm + ben_norm)])
+    for r in resume_skills_lower:
+        if not r:
+            continue
+        if r not in jd_tokens and re.search(r'\b(design|ux|ui|product|prototype|photoshop|illustrator|figma|indesign|usability|research|prototype)\b', r, flags=re.I):
+            extra_skills.append({
+                "skill": r,
+                "type": "extra",
+                "importance": 0.6,
+                "suggestion": f"You have '{r}' on your resume; add a portfolio link or strong bullet to show relevance."
+            })
+
+    # combine & sort
+    primary = [g for g in gaps if g['type'] in ('missing','transferable')]
+    learnable = [g for g in gaps if g['type'] == 'learnable']
+    combined = primary + extra_skills + learnable
+
+    def sort_key(x):
+        t = x.get('type')
+        type_rank = 3
+        if t == 'missing': type_rank = 0
+        elif t == 'transferable': type_rank = 1
+        elif t == 'extra': type_rank = 2
+        elif t == 'learnable': type_rank = 4
+        return (-x.get('importance', 0.0), type_rank, x.get('skill',''))
+
+    combined_sorted = sorted(combined, key=sort_key)
+    top_gaps = combined_sorted[:top_n]
+
+    # 5) Use LLM to enrich suggestions for the top gaps (batch call)
+    try:
+        resume_snip = {"skills": resume_norm[:80], "projects": [p.get("name") for p in (resume_parsed.get("projects") or [])[:6]]}
+        job_snip = {"title": job_parsed.get("title"), "critical_skills": crit_norm[:80]}
+        llm_results = llm_suggest_for_gaps(resume_snip, job_snip, top_gaps)
+        if llm_results:
+            # update top_gaps suggestions with LLM results where present
+            for g in top_gaps:
+                sk = g["skill"]
+                if sk in llm_results:
+                    val = llm_results[sk]
+                    if isinstance(val, dict):
+                        g["suggestion"] = val.get("suggestion", g.get("suggestion"))
+                        g["example_bullets"] = val.get("example_bullets", [])
+    except Exception:
+        log.exception("LLM enrichment for gap suggestions failed; returning baseline suggestions.")
+
+    return top_gaps
+
+def generate_personalized_recommendation(resume_parsed, job_parsed, gaps):
+    """
+    Prefer LLM-generated recommendations for richer output; fall back to prior rule-based generator.
+    """
+    try:
+        # small structured prompt
+        prompt = (
+            "You are an expert career coach. Given:\n\n"
+            f"Resume (skills): {json.dumps(resume_parsed.get('technical_skills', [])[:40])}\n\n"
+            f"Job (title & critical): {job_parsed.get('title','')} -- {json.dumps(job_parsed.get('critical_skills',[])[:40])}\n\n"
+            f"Gaps: {json.dumps(gaps[:8])}\n\n"
+            "Produce a structured recommendation JSON with keys: kind (one of 'project','certification','course','summary'), "
+            "text (concise recommendation), example_bullets (list of 1-3 example resume bullets). Keep json compact."
+        )
+        resp = ai_client.call_mixtral(prompt=prompt, system="You are a concise recommendation generator.", temperature=0.2, max_tokens=400)
+        text = resp.get("text") or ""
+        # attempt to parse JSON from response
+        # safe extraction: find first { ... } block
+        import re
+        m = re.search(r'(\{[\s\S]*\})', text)
+        if m:
+            import ast, json
+            try:
+                js = json.loads(m.group(1))
+                return js
+            except Exception:
+                # if not valid JSON, return text blob
+                return {"kind": "llm", "text": text}
+        else:
+            return {"kind": "llm", "text": text}
+    except Exception:
+        # fallback to original rule-based generator if LLM fails
+        try:
+            return globals().get('generate_personalized_recommendation', None)(resume_parsed, job_parsed, gaps)
+        except Exception:
+            # last fallback minimal
+            return {"kind": "fallback", "text": "Consider reframing top projects and adding measurable outcomes."}
+
+def handle_nl_query(parsed_resume: dict, parsed_job: dict, history: list, query: str) -> dict:
+    """
+    Use Mixtral to answer an arbitrary query about the resume+job.
+    Returns dict: {answer: str, sources: [...]}
+    """
+    # Build compact context for prompt (keep it short - LLM context matters)
+    resume_snippet = {
+        "skills": parsed_resume.get("technical_skills", [])[:30],
+        "soft_skills": parsed_resume.get("soft_skills", [])[:30],
+        "projects": [p.get("name") for p in (parsed_resume.get("projects") or [])[:6]]
+    }
+    job_snippet = {
+        "title": parsed_job.get("title") or "",
+        "critical_skills": parsed_job.get("critical_skills", [])[:30],
+        "beneficial_skills": parsed_job.get("beneficial_skills", [])[:30],
+        "responsibilities": (parsed_job.get("responsibilities") or [])[:6]
+    }
+
+    system = (
+        "You are an expert resume and recruiting assistant. Use the provided resume and job information to "
+        "answer user questions concisely, give actionable suggestions, and supply example resume bullets where appropriate. "
+        "If the user asks for rewrites, provide 2 variants: (1) concise, (2) impact + metrics."
+    )
+
+    prompt_obj = {
+        "resume": resume_snippet,
+        "job": job_snippet,
+        "history": history[-6:] if history else [],
+        "query": query
+    }
+
+    prompt = (
+        "Context (JSON):\n" + json.dumps(prompt_obj, indent=2) + "\n\n"
+        "Answer the query in clear sections. If you provide recommendations, label them 'Recommendation' and give 2-3 concrete steps. "
+        "If the user asks 'rewrite' or 'improve', produce example bullets. Keep answers actionable and role-aware."
+    )
+
+    resp = ai_client.call_mixtral(prompt=prompt, system=system, temperature=0.1, max_tokens=512)
+    text = resp.get("text") or resp.get("message") or ""
+    return {"answer": text, "raw": resp}
+
+
+
+
 def call_claude_parse(prompt_json):
     raw = (prompt_json.get("input_text") or "").strip()
     parsed = {
@@ -534,7 +1342,6 @@ def call_claude_parse(prompt_json):
     text = re.sub(r'\n{3,}', '\n\n', text)
 
     contact = _extract_contact_info(text)
-    # run spaCy-based NER to improve contact/company/title extraction
     try:
         ner = ner_extract_entities(text)
     except Exception:
@@ -546,7 +1353,7 @@ def call_claude_parse(prompt_json):
     parsed['contact'] = contact
     sections = _split_sections_by_headings(text)
 
-    # technical skills extraction
+    # technical skills extraction (unchanged flow) ...
     skills_candidates = []
     for k, v in sections.items():
         k_low = k.lower()
@@ -567,15 +1374,22 @@ def call_claude_parse(prompt_json):
         cap = m.group(1).strip()
         tech_skills += _lines_to_skills(cap, strict=False)
 
-    seen = set()
-    final_tech = []
-    for t in tech_skills:
-        tn = t.lower().strip()
-        if tn and tn not in seen:
-            final_tech.append(t.strip()); seen.add(tn)
+    # seen = set()
+    # final_tech = []
+    # for t in tech_skills:
+    #     tn = t.lower().strip()
+    #     if tn and tn not in seen:
+    #         final_tech.append(t.strip()); seen.add(tn)
 
-    final_tech = [t for t in final_tech if not re.search(r'\b(project|product|intern|manager|lead|experience|develop|worked)\b', t, flags=re.I)]
-    parsed['technical_skills'] = auto_normalize_skills(final_tech)
+    tech_skills = _dedupe_preserve_order(tech_skills)
+
+    # 2) apply the existing filtering to remove non-skill tokens
+    filtered_raw = [t.strip() for t in tech_skills
+                    if t and not re.search(r'\b(project|product|intern|manager|lead|experience|develop|worked)\b', t, flags=re.I)]
+
+    normalized = auto_normalize_skills(filtered_raw)
+
+    parsed['technical_skills'] = _dedupe_preserve_order(normalized)
 
     # soft skills
     soft_found = []
@@ -587,7 +1401,7 @@ def call_claude_parse(prompt_json):
             soft_found.append('leadership')
     parsed['soft_skills'] = soft_found
 
-    # experience extraction (best-effort) - largely preserved
+    # experience extraction (preserved) ...
     exps = []
     exp_block = None
     for h in sections:
@@ -643,8 +1457,6 @@ def call_claude_parse(prompt_json):
         exps = cand
 
     parsed['experience'] = exps
-
-    # post-process experience entries with spaCy-derived NER hints
     try:
         ner_glob = ner if 'ner' in locals() else ner_extract_entities(text)
         primary_org = ner_glob.get('orgs', [None])[0] if ner_glob else None
@@ -672,7 +1484,7 @@ def call_claude_parse(prompt_json):
     except Exception:
         pass
 
-    # projects extraction and rest of parse flow preserved (unchanged logic)
+    # projects extraction (preserved) ...
     def _extract_tech_list_from_text(txt):
         if not txt:
             return []
@@ -734,31 +1546,27 @@ def call_claude_parse(prompt_json):
                     "technologies": techs,
                     "source": h
                 })
-   
+
     for exp in parsed.get('experience', []):
         if not isinstance(exp, dict):
             continue
         desc_full = (exp.get('description') or "").strip()
         if not desc_full:
             continue
-        # split into candidate sentences / phrases
         cand_sents = [s.strip() for s in re.split(r'[.\n;•\-]{1,}\s*', desc_full) if s.strip()]
         for sent in cand_sents:
             if _is_project_sentence(sent):
                 expanded = _expand_to_paragraph(sent, desc_full)
                 techs = _extract_tech_list_from_text(expanded)
-                # attempt to create readable name
                 heading_match = re.split(r'[:\-\|]\s*', expanded.strip(), 1)[0]
                 if 6 <= len(heading_match.split()) <= 12:
                     name = heading_match.strip()[:200]
                 else:
                     name = expanded.strip().split('\n', 1)[0][:200]
-                # dedupe based on description prefix
                 dup = False
                 for p in projects:
                     if expanded.strip()[:120].lower() in p.get('description','').lower() or p.get('description','').strip()[:120].lower() in expanded.strip().lower():
                         dup = True
-                        # merge tech tokens if needed
                         p_techs = set([t.lower() for t in p.get('technologies', [])])
                         for t in techs:
                             if t and t.lower() not in p_techs:
@@ -779,18 +1587,14 @@ def call_claude_parse(prompt_json):
         if techs:
             tech_stack_candidates.extend([t for t in techs if t and t.strip()])
 
-    # Merge tech stack tokens into parsed technical skills later (deduped)
     if tech_stack_candidates:
         normalized_from_stack = auto_normalize_skills(list(dict.fromkeys(tech_stack_candidates)))
         existing_techs_lower = {t.lower() for t in parsed.get('technical_skills', [])}
         new_techs = [t for t in normalized_from_stack if t and t.lower() not in existing_techs_lower]
         parsed['technical_skills'] = (parsed.get('technical_skills') or []) + new_techs
 
-    # 4) Also consider explicit "tech stack" inside paragraphs as non-project (avoid false positives)
-    # (this is redundant but safe in case earlier code added pseudo-projects elsewhere)
     projects = [p for p in projects if (p.get('name') or "").strip().lower() not in ("tech stack", "tech-stack", "techstack")]
 
-  
     seen_map = {}
     final_projects = []
     for p in projects:
@@ -813,46 +1617,76 @@ def call_claude_parse(prompt_json):
             p['technologies'] = techs
             final_projects.append(p)
 
-    def _looks_like_real_project(p):
-        if not p or not isinstance(p, dict):
-            return False
-        name = (p.get('name') or "").strip()
-        desc = (p.get('description') or "").strip()
-        techs = p.get('technologies') or []
-        # reject explicit tech-stack named entries
-        if name.lower() in ("tech stack", "tech-stack", "techstack"):
-            return False
-        # reject very short descriptions that are mostly tech tokens
-        if len(desc) < 40:
-            tokens = [tk for tk in re.split(r'[\s,;|/]+', desc.lower()) if tk.strip()]
-            if not tokens:
+        def _looks_like_real_project(p):
+            if not p or not isinstance(p, dict):
                 return False
-            tech_like = sum(1 for tk in tokens if re.match(r'^[a-z0-9\+\#\.\-]+$', tk))
-            if tech_like >= max(2, len(tokens)//2):
+            name = (p.get('name') or "").strip()
+            desc = (p.get('description') or "").strip()
+            techs = p.get('technologies') or []
+            if name.lower() in ("tech stack", "tech-stack", "techstack"):
                 return False
-        # accept if description contains project verbs or metrics
-        if re.search(r'\b(project|prototype|launched|developed|implemented|designed|built|ship|deployed|created|led)\b', desc, flags=re.I):
-            return True
-        # accept if description length indicates substantive content
-        if len(desc) >= 80:
-            return True
-        # accept if name is descriptive (3+ words)
-        if name and len(name.split()) >= 3:
-            return True
-        return False
+            # Accept projects if:
+            #  - description is reasonably long, OR
+            #  - technologies present, OR
+            #  - contains project cues (developed/implemented/designed) even if short
+            if len(desc) >= 50:
+                return True
+            if techs and len(techs) >= 1:
+                return True
+            if re.search(r'\b(project|prototype|launched|developed|built|designed|implemented|created|led)\b', desc, flags=re.I):
+                return True
+            # small-name multiword projects accepted
+            if name and len(name.split()) >= 2 and len(desc) >= 30:
+                return True
+            return False
+
 
     filtered_projects = [p for p in projects if _looks_like_real_project(p)]
-
-    # if filtering removed everything, fall back to the top few original projects (but still exclude tech-stack names)
     if not filtered_projects:
-        # choose non tech-stack projects up to 3
         filtered_projects = [p for p in projects if (p.get('name') or "").strip().lower() not in ("tech stack","tech-stack","techstack")][:3]
     else:
-        filtered_projects = filtered_projects[:4]  # show up to 4 real projects
+        filtered_projects = filtered_projects[:4]
+
+        # --- fallback: if no projects found, scan experience and summary for candidate project sentences ---
+    if not filtered_projects:
+        fallback_projects = []
+        # 1) from experience descriptions
+        for e in parsed.get('experience', []):
+            try:
+                desc = (e.get('description') or "")
+                if not desc: continue
+                # find short sentences containing key cues
+                for sent in re.split(r'(?<=[\.\n])\s+', desc):
+                    if len(sent.strip()) < 10: continue
+                    if re.search(r'\b(designed|developed|implemented|launched|prototype|project|built|created)\b', sent, flags=re.I):
+                        name = sent.strip().split('.')[0][:120]
+                        fallback_projects.append({
+                            "name": name,
+                            "description": _expand_to_paragraph(sent, desc),
+                            "technologies": _extract_tech_list_from_text(desc),
+                            "source": e.get('company') or e.get('role') or 'experience'
+                        })
+            except Exception:
+                continue
+        # 2) from summary
+        summ = parsed.get('summary','') or ""
+        for sent in re.split(r'(?<=[\.\n])\s+', summ):
+            if len(sent.strip()) < 12: continue
+            if re.search(r'\b(project|prototype|designed|developed|launched)\b', sent, flags=re.I):
+                fallback_projects.append({"name": sent.strip()[:120], "description": sent.strip(), "technologies": _extract_tech_list_from_text(summ), "source": "summary"})
+        # attach up to 3 fallback projects
+        if fallback_projects:
+            # dedupe and keep the longest descriptions
+            seenp = set(); fp = []
+            for p in fallback_projects:
+                key = (p.get('name','') or '').strip().lower()
+                if key in seenp: continue
+                seenp.add(key); fp.append(p)
+                if len(fp) >= 3: break
+            filtered_projects = fp
 
     parsed['projects'] = filtered_projects
 
-    # education & certifications
     edu = []
     for h, block in sections.items():
         if re.search(r'(?i)education', h):
@@ -877,7 +1711,6 @@ def call_claude_parse(prompt_json):
                 first_para = p.strip(); break
         parsed['summary'] = first_para[:800]
 
-    # ensure lists
     parsed['technical_skills'] = parsed.get('technical_skills') or []
     parsed['soft_skills'] = parsed.get('soft_skills') or []
     parsed['projects'] = parsed.get('projects') or []
@@ -887,7 +1720,7 @@ def call_claude_parse(prompt_json):
 
     return parsed
 
-# parse_and_store_resume / parse_and_store_job etc. remain unchanged
+# parse_and_store_resume / parse_and_store_job remain functionally same as before
 def parse_and_store_resume(resume_obj):
     text = ""
     try:
@@ -955,859 +1788,452 @@ def parse_and_store_job(job_obj):
     job_obj.parsed = parsed; job_obj.title = parsed_title; job_obj.save()
     return parsed
 
-def parse_job_description_text(raw_text):
-    # (kept the JD parsing logic intact exactly as earlier)
-    text = (raw_text or "").strip(); lower = text.lower()
-    lines = [ln.rstrip() for ln in text.splitlines()]
-    heading_keywords = [
-        "requirements", "required qualifications", "must have", "qualifications",
-        "minimum qualifications", "preferred qualifications", "preferred", "nice to have",
-        "responsibilities", "what you'll do", "what you will do", "role", "about the role"
-    ]
-    heading_positions = []
-    for i, ln in enumerate(lines):
-        clean = ln.strip()
-        if not clean: continue
-        cmp = clean.rstrip(':').strip().lower()
-        if any(cmp == hk or cmp.startswith(hk) for hk in heading_keywords):
-            heading_positions.append((i, clean.rstrip(':'))); continue
-        if 1 <= len(clean.split()) <= 6 and re.match(r'^[A-Za-z0-9 \-&()\/]+:?\s*$', clean):
-            heading_positions.append((i, clean.rstrip(':')))
+# --- Helpers for improved JD parsing: place these above parse_job_description_text in utils.py ---
 
-    sections = {}
-    if heading_positions:
-        heading_positions = sorted(heading_positions, key=lambda x: x[0])
-        for idx, (pos, heading) in enumerate(heading_positions):
-            start = pos + 1
-            end = heading_positions[idx + 1][0] if idx + 1 < len(heading_positions) else len(lines)
-            content = "\n".join(lines[start:end]).strip()
-            sections[heading.strip()] = content
-    else:
-        sections = {"body": text}
-
-    def get_section_by_names(names):
-        for k, v in sections.items():
-            kl = k.lower()
-            for name in names:
-                if name in kl or kl.startswith(name):
-                    return v
-        return ""
-
-    requirements = get_section_by_names(["requirement", "minimum qualification", "must have", "qualification"])
-    preferred = get_section_by_names(["preferred", "nice to have", "desired qualification"])
-    responsibilities = get_section_by_names(["responsibil", "what you'll do", "role", "you will", "about the role"])
-
-    def _bullets_from_block(block_text):
-        if not block_text: return []
-        cands = []
-        for ln in re.split(r'[\r\n]+', block_text):
-            if not ln or not ln.strip(): continue
-            s = ln.strip()
-            s = re.sub(r'^\s*[-•\*\u2022]\s*', '', s)
-            cands.append(s.strip())
-        return cands
-
-    requirement_candidates = []
-    if requirements:
-        requirement_candidates.append(requirements); requirement_candidates += _bullets_from_block(requirements)
-        for par in re.findall(r'\(([^)]+)\)', requirements):
-            requirement_candidates.append(par)
-    else:
-        all_bullets = []
-        for ln in lines:
-            if re.match(r'^\s*[-•\*\u2022]\s+', ln):
-                all_bullets.append(re.sub(r'^\s*[-•\*\u2022]\s+', '', ln).strip())
-        for b in all_bullets:
-            if re.search(r'\b(experience|years|experience in|knowledge of|experience with|degree|must|minimum|required|qualification|work authorization)\b', b, flags=re.I):
-                requirement_candidates.append(b)
-        for par in re.findall(r'\(([^)]+)\)', text):
-            requirement_candidates.append(par)
-
-    preferred_candidates = []
-    if preferred:
-        preferred_candidates.append(preferred); preferred_candidates += _bullets_from_block(preferred)
-        for par in re.findall(r'\(([^)]+)\)', preferred):
-            preferred_candidates.append(par)
-
-    if not requirement_candidates:
-        header_snippet = text.split('\n\n', 1)[0][:800]
-        strict_header = _lines_to_skills(header_snippet, strict=True)
-        if strict_header:
-            requirement_candidates += strict_header
-
-    def clean_parenthetical(p):
-        return re.sub(r'(?i)\b(e\.g\.|eg:|for example:|such as:|e\.g)\b', '', p).strip()
-
-    requirement_candidates = [clean_parenthetical(c) for c in requirement_candidates if c and c.strip()]
-    preferred_candidates = [clean_parenthetical(c) for c in preferred_candidates if c and c.strip()]
-
-    try:
-        critical = auto_normalize_skills(requirement_candidates)[:80]
-    except Exception:
-        critical = []
-        for r in requirement_candidates:
-            critical += _lines_to_skills(r, strict=True)
-        seen_c = set(); tmp = []
-        for c in critical:
-            k = c.lower().strip()
-            if k not in seen_c:
-                seen_c.add(k); tmp.append(c)
-        critical = tmp[:80]
-
-    try:
-        beneficial = auto_normalize_skills(preferred_candidates)[:80]
-    except Exception:
-        beneficial = []
-        for p in preferred_candidates:
-            beneficial += _lines_to_skills(p, strict=True)
-        seen_b = set(); tmpb = []
-        for b in beneficial:
-            k = b.lower().strip()
-            if k not in seen_b:
-                seen_b.add(k); tmpb.append(b)
-        beneficial = tmpb[:80]
-
-    resp_list = []
-    if responsibilities:
-        for part in re.split(r'[\n;•\-–]+', responsibilities):
-            p = part.strip()
-            if not p: continue
-            if len(p) > 300: continue
-            if re.search(r'^\s*(develop|design|implement|build|manage|lead|produce|work independently|work on|master|deliver|maintain|test|create|demonstrate)\b', p, flags=re.I) or len(p.split()) <= 40:
-                resp_list.append(p)
-    else:
-        for ln in lines:
-            if re.match(r'^\s*[-•\*\u2022]\s+', ln):
-                candidate = re.sub(r'^\s*[-•\*\u2022]\s+', '', ln).strip()
-            else:
-                candidate = ln.strip()
-            if not candidate: continue
-            if len(candidate.split()) > 40: continue
-            if re.search(r'^\s*(develop|design|implement|build|manage|lead|produce|work|master|deliver|maintain|test|create|demonstrate)\b', candidate, flags=re.I) or len(candidate.split()) <= 20:
-                if re.search(r'\b(degree|bachelor|master|must obtain|work authorization|must have|required|minimum)\b', candidate, flags=re.I):
-                    continue
-                resp_list.append(candidate)
-    seen_r = set(); final_resp = []
-    for r in resp_list:
-        k = r.lower().strip()
-        if k in seen_r: continue
-        seen_r.add(k); final_resp.append(r)
-    resp_list = final_resp[:50]
-
-    years = None
-    m = re.search(r'(?i)(?:minimum|at least)?\s*(\d+)\+?\s*(?:years|yrs)\b', text)
-    if m:
-        try:
-            years = int(m.group(1))
-        except Exception:
-            years = None
-
-    level = "Unknown"
-    if re.search(r'\bsenior\b|\bsr\.\b', lower):
-        level = "Senior"
-    elif re.search(r'\b(mid|experienced|lead)\b', lower):
-        level = "Mid"
-    elif re.search(r'\b(junior|entry|graduate|fresher|university grad)\b', lower):
-        level = "Junior"
-
-    domain_keywords = list(set(re.findall(r'\b(fintech|healthcare|e-?commerce|cloud|security|machine learning|ml|data science|embedded|iot|devops|platform)\b', lower, flags=re.I)))
-
-    first_lines = [l.strip() for l in text.splitlines() if l.strip()][:5]
-    title = ""
-    if first_lines:
-        if re.search(r' - | — | – ', first_lines[0]) or len(first_lines[0].split()) <= 12:
-            title = first_lines[0]
-        else:
-            title = first_lines[0]
-
-    return {
-        "title": title[:200],
-        "critical_skills": critical,
-        "beneficial_skills": beneficial,
-        "experience_level": level,
-        "years_required": years,
-        "responsibilities": resp_list,
-        "domain_keywords": domain_keywords
-    }
-
-# ---------- Embeddings & matching (kept intact) ----------
-@lru_cache(maxsize=1)
-def get_embedding_model():
+def _split_or_group_degree_phrases(text_block):
     """
-    Return either ("st", SentenceTransformer_instance) or ("spacy", nlp) or None.
-    Keeps behavior compatible with earlier code that returned a tuple.
+    Convert "A, B, or C" and "A or B" lists into balanced multi-word candidates.
+    Preserve known multi-word noun phrases such as 'industrial design' or 'product design'
+    and return a list of candidate phrase strings.
     """
-    # Prefer sentence-transformers if available
-    try:
-        from sentence_transformers import SentenceTransformer
-        model_name = os.getenv("SENTENCE_TRANSFORMER_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
-        try:
-            m = SentenceTransformer(model_name)
-            log.info("Loaded sentence-transformers model: %s", model_name)
-            return ("st", m)
-        except Exception as e_st:
-            log.debug("sentence-transformers load failed: %s", e_st, exc_info=True)
-    except Exception as e_import:
-        log.debug("sentence-transformers not installed: %s", e_import)
+    out = []
+    if not text_block:
+        return out
 
-    # Fallback: spaCy (prefer transformer model then small model)
-    try:
-        import spacy
-        for mdl in ("en_core_web_trf", "en_core_web_sm"):
-            try:
-                nlp = spacy.load(mdl)
-                # quick test for vector availability
-                test = nlp("test embedding")
-                vec = getattr(test, "vector", None)
-                if vec is not None and len(vec) > 0:
-                    log.info("Using spaCy model '%s' as vector fallback", mdl)
-                    return ("spacy", nlp)
-                else:
-                    # spaCy loaded but doc.vector empty
-                    log.warning("spaCy model '%s' loaded but doc.vector empty. NER usable but vector fallback not available.", mdl)
-                    return ("spacy", nlp)
-            except Exception:
-                continue
-    except Exception as e_spacy:
-        log.debug("spaCy not available: %s", e_spacy, exc_info=True)
-
-    log.warning("No embedding backend available (sentence-transformers nor spaCy). Falling back to rule-based.")
-    return None
-
-def embed_texts(texts):
-    if texts is None:
-        return None
-
-    # normalize input to list
-    if isinstance(texts, str):
-        texts_list = [texts]
-    else:
-        try:
-            texts_list = list(texts)
-        except Exception:
-            texts_list = [str(texts)]
-
-    backend = get_embedding_model()
-    if not backend:
-        log.debug("embed_texts: no backend available, returning None")
-        return None
-
-    kind, model = backend  # unpack safely
-    try:
-        if kind == "st":
-            # sentence-transformers API: model.encode([...], convert_to_numpy=True)
-            try:
-                emb = model.encode(texts_list, convert_to_numpy=True, show_progress_bar=False)
-                # ensure numpy array
-                emb = np.asarray(emb)
-                return emb
-            except TypeError:
-                # older versions may not accept convert_to_numpy param
-                emb = model.encode(texts_list, show_progress_bar=False)
-                return np.asarray(emb)
-        elif kind == "spacy":
-            vecs = []
-            for t in texts_list:
-                doc = model(str(t))
-                v = getattr(doc, "vector", None)
-                if v is None or (hasattr(v, "__len__") and len(v) == 0):
-                    # spaCy loaded but no vectors available for this model
-                    log.debug("embed_texts: spaCy doc.vector empty for text (using zeros): %s", str(t)[:80])
-                    # create zeros vector of reasonable size if possible
-                    try:
-                        dim = len(model("test").vector)
-                        vecs.append(np.zeros(dim, dtype=float))
-                    except Exception:
-                        vecs.append(np.zeros(1, dtype=float))
-                else:
-                    vecs.append(np.asarray(v))
-            if not vecs:
-                return None
-            return np.vstack(vecs)
-        else:
-            log.warning("embed_texts: unknown backend kind '%s'", kind)
-            return None
-    except Exception as e:
-        # Log one informative message but avoid spamming stack traces repeatedly.
-        log.exception("embed_texts failed using backend '%s': %s", kind, e)
-        return None
-
-
-def cosine_sim(a, b):
-    if a is None or b is None:
-        return None
-    try:
-        model = get_embedding_model()
-        if util is not None and model is not None:
-            try:
-                return util.cos_sim(a, b).cpu().numpy()
-            except Exception:
-                pass
-        a = np.asarray(a, dtype=np.float32)
-        b = np.asarray(b, dtype=np.float32)
-        if a.ndim == 1: a = a.reshape(1, -1)
-        if b.ndim == 1: b = b.reshape(1, -1)
-        a_norm = a / (np.linalg.norm(a, axis=1, keepdims=True) + 1e-8)
-        b_norm = b / (np.linalg.norm(b, axis=1, keepdims=True) + 1e-8)
-        return np.dot(a_norm, b_norm.T)
-    except Exception:
-        log.exception("cosine_sim fallback failed")
-        return None
-
-
-# ---------- Equivalence & matching ----------
-_JACCARD_HIGH = 0.5
-_JACCARD_MED = 0.25
-
-def _extract_keywords_from_phrase(phrase, max_terms=6):
-    if not phrase:
-        return []
-    txt = re.sub(r'[^A-Za-z0-9\+\#\.\s\-]', ' ', phrase)
-    parts = [p.strip().lower() for p in re.split(r'[\s\-]+', txt) if p.strip()]
-    parts = [p for p in parts if p not in _SHORT_STOPWORDS and len(p) > 1]
-    return parts[:max_terms]
-
-def is_equivalent(skill, candidate_skills):
-    s = (skill or "").strip()
-    if not s:
-        return False, 0.0
-    cand = [c for c in (candidate_skills or []) if c]
-    cand_norm = [normalize_token(c) for c in cand]
-
-    kb_skill, canonical, matched_syns = kb_lookup(skill)
-    if kb_skill:
-        variants = {normalize_token(canonical)}
-        for syn in (kb_skill.synonyms or []):
-            variants.add(normalize_token(syn))
-        for c in cand_norm:
-            if c in variants:
-                return True, 1.0
-        for c in cand_norm:
-            for v in variants:
-                if v in c or c in v:
-                    return True, 0.9
-
-    s_norm = normalize_token(s)
-    for key, alts in EQUIVALENCES.items():
-        if s_norm == normalize_token(key):
-            for alt in alts:
-                if normalize_token(alt) in cand_norm:
-                    return True, 0.9
-
-    for c in cand_norm:
-        if s_norm in c or c in s_norm:
-            return True, 0.5
-
-    s_tokens = set(_extract_keywords_from_phrase(s))
-    best_overlap = 0.0
-    for c in cand:
-        c_tokens = set(_extract_keywords_from_phrase(c))
-        if not s_tokens or not c_tokens:
+    # Split by semicolons or newlines into sentence-sized chunks
+    parts = re.split(r'[\r\n;]+', text_block)
+    for part in parts:
+        part = part.strip()
+        if not part:
             continue
-        inter = s_tokens & c_tokens
-        union = s_tokens | c_tokens
-        overlap = (len(inter) / len(union)) if union else 0
-        if overlap > best_overlap:
-            best_overlap = overlap
-    if best_overlap >= _JACCARD_HIGH:
-        return True, 0.6
-    if best_overlap >= _JACCARD_MED:
-        return True, 0.5
 
-    model = get_embedding_model()
-    try:
-        if model is not None and cand:
-            s_emb = embed_texts([s])
-            cand_emb = embed_texts(cand)
-            if s_emb is not None and cand_emb is not None:
-                sims = cosine_sim(s_emb, cand_emb)
-                if sims is not None and sims.size > 0:
-                    if float(sims.max()) >= SIM_THRESHOLD:
-                        return True, 0.85
-    except Exception:
-        log.debug("embedding fallback in is_equivalent failed", exc_info=True)
-
-    return False, 0.0
-
-# ---------- public functions: semantic/gap/recommendation ----------
-
-def semantic_match_score(resume_parsed, job_parsed):
-    """
-    Improved semantic match scoring:
-     - More generous semantic thresholds
-     - Strong boost for exact degree / language matches
-     - Rebalanced weights prioritizing critical skills + projects
-     - Rounds final score to whole number (0-10)
-    Returns: {"score": int, "rating": str, "breakdown": dict, "raw_points": float, "max_points": 1.0}
-    """
-    resume_skills = (resume_parsed.get("technical_skills", []) or []) + (resume_parsed.get("soft_skills", []) or [])
-    resume_projects = resume_parsed.get("projects", []) or []
-    resume_exps = resume_parsed.get("experience", []) or []
-
-    job_crit = job_parsed.get("critical_skills", []) or []
-    job_benef = job_parsed.get("beneficial_skills", []) or []
-
-    # Rebalanced weights: critical skills and projects prioritized for early-career roles
-    CRIT_WEIGHT = 0.50
-    BEN_WEIGHT = 0.10
-    EXP_WEIGHT = 0.15
-    PROJ_WEIGHT = 0.25
-
-    # Compose resume text snippets for embedding fallback
-    resume_sentences = []
-    for p in resume_projects:
-        if isinstance(p, dict):
-            if p.get('name'): resume_sentences.append(p.get('name'))
-            if p.get('description'): resume_sentences.append(p.get('description'))
-            for t in (p.get('technologies') or []):
-                if t: resume_sentences.append(t)
-    for r in resume_exps:
-        if isinstance(r, dict):
-            if r.get('role'): resume_sentences.append(r.get('role'))
-            if r.get('description'): resume_sentences.append(r.get('description'))
-    resume_sentences += [s for s in resume_skills if isinstance(s, str) and s.strip()]
-
-    job_reqs = [s for s in job_crit if s] + [s for s in job_benef if s]
-
-    model = get_embedding_model()
-    resume_emb = None; job_emb = None; sim_matrix = None
-    try:
-        if model is not None:
-            if resume_sentences:
-                resume_emb = embed_texts(resume_sentences)
-            if job_reqs:
-                job_emb = embed_texts(job_reqs)
-            if job_emb is not None and resume_emb is not None and getattr(job_emb, "size", 0) and getattr(resume_emb, "size", 0):
-                sim_matrix = cosine_sim(job_emb, resume_emb)
-    except Exception:
-        log.debug("Embedding precompute failed in semantic_match_score; falling back to rule/heuristic checks.")
-
-    num_crit = max(1, len(job_crit))
-    num_ben = max(1, len(job_benef))
-
-    breakdown = {"critical": {}, "beneficial": {}, "experience": {}, "projects": {}}
-    weighted_sum = 0.0
-
-    def _exact_degree_or_field_match(job_skill_text):
-        """
-        Give strong credit when the job asks for a degree/field and resume indicates related education.
-        """
-        jlow = (job_skill_text or "").lower()
-        if re.search(r'\b(computer science|computer engineering|software engineering|relevant technical field|university grad)\b', jlow):
-            edu_list = resume_parsed.get('education', []) or []
-            for e in edu_list:
-                if isinstance(e, str) and re.search(r'\b(computer science|computer engineering|m\.?tech|b\.?tech|bachelor|master|bachelor of|degree)\b', e, flags=re.I):
-                    return True
-            # also check summary and header
-            summ = (resume_parsed.get('summary') or "") + " " + " ".join(resume_parsed.get('technical_skills') or [])
-            if re.search(r'\b(computer science|computer engineering|software engineering)\b', summ, flags=re.I):
-                return True
-        return False
-
-    def compute_skill_credit(skill_text, idx_in_job_reqs=None):
-        # Try deterministic / KB / token rules first
-        matched, rule_score = is_equivalent(skill_text, resume_skills)
-        sem_best = 0.0
-        if sim_matrix is not None and idx_in_job_reqs is not None:
-            try:
-                if 0 <= idx_in_job_reqs < sim_matrix.shape[0]:
-                    row = sim_matrix[idx_in_job_reqs]
-                    if row is not None and getattr(row, "size", 0):
-                        sem_best = float(row.max())
-            except Exception:
-                log.debug("sim_matrix lookup error", exc_info=True)
-
-        # Degree / field exact handling
-        if _exact_degree_or_field_match(skill_text):
-            return 1.0, "1.00 (degree/field match)"
-
-        # Language / short-token exact matches get strong boost via KB/rule
-        if matched and rule_score >= 0.9:
-            return 1.0, "1.00 (exact rule high)"
-        # If semantic similarity is very high, treat as full match
-        if sem_best >= SIM_THRESHOLD:
-            return 1.0, f"1.00 (semantic {sem_best:.2f})"
-        # Near-semantic matches get generous partial credit
-        if sem_best >= (SIM_THRESHOLD - 0.15):
-            return 0.8, f"0.8 (partial semantic {sem_best:.2f})"
-        # Good rule-based but not exact (transferable) -> give higher credit
-        if matched and rule_score >= 0.45:
-            return 0.7, f"0.7 (transferable rule {rule_score:.2f})"
-        # weaker semantic signals
-        if sem_best >= (SIM_THRESHOLD - 0.30):
-            return 0.45, f"0.45 (weak semantic {sem_best:.2f})"
-        return 0.0, "0 (missing)"
-
-    # Critical skills
-    for i, s in enumerate(job_crit):
-        credit, reason = compute_skill_credit(s, idx_in_job_reqs=i)
-        contrib = (credit * CRIT_WEIGHT) / num_crit
-        weighted_sum += contrib
-        breakdown['critical'][s] = reason
-
-    # Beneficial skills
-    base_idx = len(job_crit)
-    for j, s in enumerate(job_benef):
-        idx = base_idx + j
-        credit, reason = compute_skill_credit(s, idx_in_job_reqs=idx)
-        contrib = (credit * BEN_WEIGHT) / num_ben
-        weighted_sum += contrib
-        breakdown['beneficial'][s] = reason
-
-    # Experience computation
-    resume_years = 0
-    for r in resume_exps:
-        if isinstance(r, dict):
-            s = r.get('start') or ""; e = r.get('end') or ""
-            ys = re.findall(r'(\d{4})', str(s)); ye = re.findall(r'(\d{4})', str(e))
-            try:
-                if ys and ye:
-                    start_y = int(ys[0]); end_y = int(ye[-1]); resume_years += max(0, end_y - start_y)
-                elif ys and not ye:
-                    current_year = int(time.strftime("%Y"))
-                    resume_years += max(0, (current_year - int(ys[0])))
-            except Exception:
-                pass
-
-    # pick up explicit years in summary
-    summary = (resume_parsed.get("summary") or "")
-    m = re.search(r'(\d+)\+?\s+years', summary, flags=re.I)
-    if m:
-        try:
-            years_val = int(m.group(1)); resume_years = max(resume_years, years_val)
-        except Exception:
-            pass
-
-    years_req = job_parsed.get("years_required")
-    exp_credit = 0.0
-    if years_req:
-        try:
-            years_req_i = int(years_req)
-        except Exception:
-            years_req_i = None
-        if years_req_i:
-            if resume_years >= years_req_i:
-                exp_credit = 1.0; breakdown['experience'] = f"Experience Matched"
-            elif resume_years >= max(0, years_req_i - 1):
-                exp_credit = 0.7; breakdown['experience'] = f"Nearly Matched"
-            else:
-                exp_credit = 0.2; breakdown['experience'] = f"Early Career"
-    else:
-        # entry-level role tuning: prefer project + skill evidence for interns/grads
-        cnt = len([e for e in resume_exps if isinstance(e, dict)])
-        if resume_years >= 7 or cnt >= 6:
-            exp_credit = 1.0; breakdown['experience'] = "Senior-Level"
-        elif resume_years >= 3 or cnt >= 2:
-            exp_credit = 0.7; breakdown['experience'] = "Mid-Level"
+        # If this part looks like a list with commas and an 'or'
+        if ',' in part and re.search(r'\bor\b', part, flags=re.I):
+            items = [p.strip() for p in re.split(r',\s*', part)]
+            # Handle trailing "or X" in the last item like "A, B, or C"
+            last = items[-1]
+            if re.search(r'\bor\b', last, flags=re.I):
+                last_parts = re.split(r'\bor\b', last, flags=re.I)
+                items[-1] = last_parts[0].strip()
+                items.append(last_parts[-1].strip())
+            for it in items:
+                if it:
+                    out.append(it)
+        # If it contains 'or' without commas (e.g., "X or Y")
+        elif re.search(r'\b or \b', part, flags=re.I) and ',' not in part:
+            for it in re.split(r'\bor\b', part, flags=re.I):
+                it = it.strip()
+                if it:
+                    out.append(it)
         else:
-            # early-career: still grant minimal credit if internship+projects present
-            if cnt >= 1 and resume_projects:
-                exp_credit = 0.6; breakdown['experience'] = f"Intern)"
-            else:
-                exp_credit = 0.2; breakdown['experience'] = f"Early career)"
+            out.append(part)
 
-    weighted_sum += exp_credit * EXP_WEIGHT
-
-    # Projects relevance (improve detection and scoring)
-    proj_credit_total = 0.0
-    if resume_projects:
-        for p in resume_projects:
-            if not isinstance(p, dict): continue
-            techs = p.get('technologies') or []
-            # normalize tokens
-            techs_norm = []
-            for t in techs:
-                if t and isinstance(t, str):
-                    n = _normalize_token(t)
-                    if n: techs_norm.append(n)
-            # fallback: infer techs from description
-            if not techs_norm:
-                desc = (p.get('description') or "") + " " + (p.get('name') or "")
-                inferred = []
-                common_techs = r'\b(python|flask|fastapi|django|docker|kubernetes|aws|azure|gcp|sql|sqlite|postgresql|postgres|mysql|node\.js|react|java|c\+\+|go|golang|tensorflow|scikit-learn)\b'
-                for m in re.finditer(common_techs, desc, flags=re.I):
-                    tok = _normalize_token(m.group(1))
-                    if tok and tok not in inferred: inferred.append(tok)
-                techs_norm = inferred
-
-            # token overlap with job critical skills
-            overlap_cnt = 0
-            for s in job_crit:
-                mflag, _ = is_equivalent(s, techs_norm)
-                if mflag: overlap_cnt += 1
-
-            # embedding similarity between project text and job reqs
-            proj_text = " ".join(filter(None, [p.get('name',''), p.get('description',''), " ".join(techs_norm)]))
-            proj_emb = embed_texts(proj_text) if model is not None else None
-            sem_score = 0.0
-            if proj_emb is not None and job_emb is not None:
-                try:
-                    sims = cosine_sim(job_emb, proj_emb)
-                    if sims is not None and sims.size:
-                        sem_score = float(sims.max())
-                except Exception:
-                    sem_score = 0.0
-
-            token_score = min(1.0, overlap_cnt / max(1.0, len(job_crit)))
-            proj_relevance = max(token_score * 0.8, sem_score * 0.95)
-            # small boost for presence of measurable metrics in projects
-            if re.search(r'\b(%|% accuracy|throughput|reduced|improved|\d{2,3}%|\d+%|reduced by)\b', proj_text, flags=re.I):
-                proj_relevance = min(1.0, proj_relevance + 0.05)
-            proj_credit_total += proj_relevance
-            breakdown['projects'][p.get('name','project')] = f"rel:{proj_relevance:.2f} (tokens:{overlap_cnt},sem:{sem_score:.2f})"
-
-        proj_credit = (proj_credit_total / len(resume_projects))
-    else:
-        proj_credit = 0.0
-
-    weighted_sum += proj_credit * PROJ_WEIGHT
-
-    # final score 0..10
-    final_score = max(0.0, min(1.0, weighted_sum)) * 10.0
-    # round to nearest whole number
-    rounded_score = int(round(final_score))
-
-    rating = "Weak"
-    if rounded_score >= 8:
-        rating = "Strong"
-    elif rounded_score >= 6:
-        rating = "Moderate"
-    elif rounded_score >= 4:
-        rating = "Fair"
-
-    return {"score": rounded_score, "rating": rating, "breakdown": breakdown, "raw_points": round(weighted_sum, 4), "max_points": 1.0}
+    # Post-process: protect obvious short connector fragments
+    cleaned = []
+    for cand in out:
+        # remove leading/trailing 'or a related field' style fragments
+        cand = re.sub(r'(?i)^\s*(or\s+)?a\s+related\s+field[,:]?\s*$', '', cand).strip()
+        if not cand:
+            continue
+        cleaned.append(cand)
+    return cleaned
 
 
+def _extract_candidates_from_block(block_text):
+    """
+    Produce a list of candidate requirement strings from a JD block.
+    Uses bullets, grouped lists, and parenthetical expansion while preferring multi-word phrases.
+    """
+    if not block_text:
+        return []
 
-def gap_analysis(resume_parsed, job_parsed, top_n=8):
-    resume_skills = (resume_parsed.get("technical_skills", []) or []) + (resume_parsed.get("soft_skills", []) or [])
-    raw_critical = job_parsed.get("critical_skills", []) or []
-    beneficial = job_parsed.get("beneficial_skills", []) or []
+    cands = []
 
-    crit_candidates = []
-    for item in raw_critical:
-        if not item: continue
-        if _looks_like_sentence(item) or len(item.split()) > 5:
-            kws = _extract_keywords_from_phrase(item, max_terms=6)
-            if kws:
-                twos = []
-                for i in range(len(kws)-1):
-                    twos.append(kws[i] + " " + kws[i+1])
-                candidates = kws + twos
-            else:
-                candidates = [item]
-            norm = auto_normalize_skills(candidates)
-            if norm: crit_candidates.extend(norm)
-            else:
-                short = _lines_to_skills(item, strict=True)
-                if short: crit_candidates.extend(auto_normalize_skills(short))
+    # 1) bullet lines first
+    for ln in re.split(r'[\r\n]+', block_text):
+        l = ln.strip()
+        if not l:
+            continue
+        # remove bullet markers
+        l = re.sub(r'^\s*[-•\*\u2022]\s*', '', l).strip()
+        if l:
+            cands.append(l)
+
+    # 2) group comma/or lists and extract items
+    grouped = []
+    for part in cands[:]:
+        if ',' in part or re.search(r'\bor\b', part, flags=re.I):
+            grouped.extend(_split_or_group_degree_phrases(part))
+        else:
+            grouped.append(part)
+
+    # If no bullets found, try splitting the block itself
+    if not grouped:
+        # split by sentences but keep parenthetical groups
+        for p in re.split(r'(?<=[.!?])\s+', block_text):
+            p = p.strip()
+            if p:
+                if ',' in p or re.search(r'\bor\b', p, flags=re.I):
+                    grouped.extend(_split_or_group_degree_phrases(p))
                 else:
-                    first = " ".join(item.strip().split()[:3])
-                    norm2 = auto_normalize_skills([first])
-                    if norm2: crit_candidates.extend(norm2)
+                    grouped.append(p)
+
+    # 3) Expand parenthetical fragments into their contents as separate candidates (but keep the main phrase)
+    final = []
+    for g in grouped:
+        final.append(g)
+        for par in re.findall(r'\(([^)]+)\)', g):
+            par = par.strip()
+            if par and par not in final:
+                final.append(par)
+
+    # 4) Deduplicate preserving order
+    seen = set(); out = []
+    for f in final:
+        key = f.lower().strip()
+        if key in seen: continue
+        seen.add(key)
+        out.append(f.strip())
+    return out
+
+
+# --- Replacement parse_job_description_text function ---
+
+# ------------------ helpers for improved JD parsing ------------------
+
+def _split_or_group_degree_phrases(text_block):
+    """
+    Convert 'A, B, or C' and 'A or B' lists into balanced multi-word candidates.
+    Preserve known multi-word noun phrases such as 'industrial design' or 'product design'
+    and return a list of candidate phrase strings.
+    """
+    out = []
+    if not text_block:
+        return out
+
+    # Split by semicolons or newlines into sentence-sized chunks
+    parts = re.split(r'[\r\n;]+', text_block)
+    for part in parts:
+        part = part.strip()
+        if not part:
+            continue
+
+        # If this part looks like a list with commas and an 'or'
+        if ',' in part and re.search(r'\bor\b', part, flags=re.I):
+            items = [p.strip() for p in re.split(r',\s*', part)]
+            # Handle trailing "or X" in the last item like "A, B, or C"
+            last = items[-1]
+            if re.search(r'\bor\b', last, flags=re.I):
+                # split last into its components
+                tail = re.split(r'\bor\b', last, flags=re.I)
+                # replace last with separated items
+                items = items[:-1] + [t.strip() for t in tail if t.strip()]
+            for it in items:
+                if it:
+                    out.append(it)
         else:
-            norm = auto_normalize_skills([item])
-            if norm: crit_candidates.extend(norm)
-            else: crit_candidates.append(item.strip())
+            # Not an explicit list; try to preserve multiword noun phrases by returning the part
+            out.append(part)
+    # final cleaning
+    cleaned = []
+    for o in out:
+        o = re.sub(r'^\s*[-•\*\u2022]\s*', '', o).strip()
+        if o and o not in cleaned:
+            cleaned.append(o)
+    return cleaned
 
-    seen = set(); critical = []
-    for c in crit_candidates:
-        if not c: continue
-        k = c.lower().strip()
-        if k not in seen:
-            seen.add(k); critical.append(c)
 
-    gaps = []
-    for s in critical:
-        matched, score = is_equivalent(s, resume_skills)
-        if matched: continue
-        transferable = False; related = []
-        for key, alts in EQUIVALENCES.items():
-            if normalize_token(s) == normalize_token(key):
-                for a in alts:
-                    if normalize_token(a) in [normalize_token(x) for x in resume_skills]:
-                        transferable = True; related.append(a)
-        s_tokens = set(_extract_keywords_from_phrase(s))
-        for rs in resume_skills:
-            r_tokens = set(_extract_keywords_from_phrase(rs))
-            if s_tokens and r_tokens:
-                ov = len(s_tokens & r_tokens) / float(len(s_tokens | r_tokens))
-                if ov >= 0.20 and ov < _JACCARD_HIGH:
-                    transferable = True; related.append(rs)
-        if transferable:
-            suggestion = f"Highlight related experience: {', '.join(list(dict.fromkeys(related))[:3])}. Move those bullets to top of experience or summary."
-            gaps.append({"skill": s, "type": "transferable", "importance": 1.0, "suggestion": suggestion})
+def _extract_candidates_from_block(block_text):
+    """
+    Try to extract multi-word candidate phrases from a 'requirements' block.
+    Strategy: find comma separated items, parenthetical lists, and phrases linked by 'or'.
+    This returns a list of candidate string phrases (keeps multiword tokens).
+    """
+    if not block_text:
+        return []
+
+    candidates = []
+    # Look for obvious parenthetical enumerations: (A, B or C)
+    for par in re.findall(r'\(([^)]+)\)', block_text):
+        candidates += _split_or_group_degree_phrases(par)
+
+    # Break large block into lines/bullets; each line is a candidate
+    lines = [ln.strip() for ln in re.split(r'[\r\n]+', block_text) if ln.strip()]
+    for ln in lines:
+        # strip bullets and leading markers
+        ln_clean = re.sub(r'^\s*[-•\*\u2022]\s*', '', ln).strip()
+        # if line looks like "A, B or C" group them
+        if ',' in ln_clean and re.search(r'\bor\b', ln_clean, flags=re.I):
+            candidates += _split_or_group_degree_phrases(ln_clean)
         else:
-            suggestion = f"This role requires '{s}' but your resume doesn't mention it. Consider adding it or a short micro-project demonstrating it (e.g., small Dockerized API)."
-            gaps.append({"skill": s, "type": "missing", "importance": 1.0, "suggestion": suggestion})
+            # preserve as-is (multiword)
+            candidates.append(ln_clean)
 
-    ben_norm = []
-    for b in beneficial:
-        norm = auto_normalize_skills([b]) or [b]
-        ben_norm.extend(norm)
-    for s in ben_norm:
-        matched, _ = is_equivalent(s, resume_skills)
-        if not matched:
-            suggestion = f"Optional but helpful: learn '{s}' and add a demonstrable artifact or short project."
-            gaps.append({"skill": s, "type": "learnable", "importance": 0.4, "suggestion": suggestion})
-
-    gaps_sorted = sorted(gaps, key=lambda x: (-x['importance'], x['type']))
-    return gaps_sorted[:top_n]
-
-def _short_reframe_example(existing_skill, target_skill):
-    existing_skill = existing_skill or ''
-    target_skill = target_skill or ''
-    if 'docker' in existing_skill.lower() or 'kubernetes' in existing_skill.lower():
-        return f"describe how your containerized services map to {target_skill} deployment and scaling"
-    if 'django' in existing_skill.lower() or 'flask' in existing_skill.lower():
-        return f"emphasize deploying the {existing_skill} app to cloud infra (e.g., EC2 / S3) to show {target_skill} relevance"
-    return f"explain how your experience with {existing_skill} transfers to {target_skill}"
-
-def generate_personalized_recommendation(resume_parsed, job_parsed, gaps, use_llm=False, llm_fn=None):
-    projects = resume_parsed.get("projects", []) or []
-    for p in projects:
-        techs = p.get('technologies') or []
-        if techs:
-            norm = []
-            for t in techs:
-                if not t: continue
-                n = _normalize_token(t)
-                if n: norm.append(n)
-            p['technologies'] = norm
-
-    def infer_techs_from_text(txt):
-        if not txt: return []
-        common_techs_re = r'\b(python|flask|fastapi|django|docker|kubernetes|aws|azure|gcp|sql|sqlite|postgresql|postgres|mysql|node\.js|react|java|c\+\+|c#|go|golang)\b'
-        found = []
-        for m in re.finditer(common_techs_re, txt, flags=re.I):
-            tok = _normalize_token(m.group(1))
-            if tok and tok not in found: found.append(tok)
-        return found
-
-    model = get_embedding_model()
-    _emb_cache = {}
-    def get_emb_once_local(text):
-        if not text: return None
-        key = text if isinstance(text, str) else str(text)
-        if key in _emb_cache: return _emb_cache[key]
-        emb = embed_texts(text)
-        _emb_cache[key] = emb; return emb
-
-    job_crit = job_parsed.get("critical_skills", []) or []
-    best_project = None; best_score = 0.0
-    for p in projects:
-        name = p.get('name','').strip()
-        techs = p.get('technologies') or []
-        if not techs:
-            techs = infer_techs_from_text((p.get('description') or "") + " " + name)
-        token_overlap = 0.0
-        if techs and job_crit:
-            overlaps = 0
-            for jc in job_crit:
-                matched, _ = is_equivalent(jc, techs)
-                if matched: overlaps += 1
-            token_overlap = overlaps / max(1.0, len(job_crit))
-        sem_score = 0.0
-        try:
-            if model is not None:
-                proj_text = " ".join(filter(None, [name, p.get('description',''), " ".join(techs)]))
-                p_emb = get_emb_once_local(proj_text)
-                if p_emb is not None and job_crit:
-                    j_emb = get_emb_once_local(tuple(job_crit)) or embed_texts(job_crit)
-                    if j_emb is not None:
-                        sims = cosine_sim(j_emb, p_emb)
-                        if sims is not None and getattr(sims, "size", 0):
-                            sem_score = float(sims.max())
-        except Exception:
-            sem_score = 0.0
-        relevance = max(token_overlap * 0.75, sem_score * 0.9)
-        if techs: relevance += 0.05
-        if relevance > best_score:
-            best_score = relevance; best_project = p
-
-    if best_project and best_score >= 0.45:
-        name = best_project.get('name','Project')
-        techs = best_project.get('technologies') or []
-        if not techs:
-            techs = infer_techs_from_text((best_project.get('description') or "") + " " + name)
-        desc = (best_project.get('description') or "").strip()
-        short_desc = (desc[:180] + '...') if len(desc) > 180 else desc
-        example_bullet = f"Developed {name} using {', '.join(techs[:4])} — {short_desc}" if techs else f"Developed {name} — {short_desc}"
-        text_template = (f"Type A — Reframe an existing project: Move the project '{name}' to the top of your experience. "
-                         f"Open the project bullet with technologies ({', '.join(techs[:4])}) and a one-line impact/delivery statement. "
-                         f"Example bullet: \"{example_bullet}\"")
-        return {"kind": "A", "text": text_template, "example_bullet": example_bullet, "project": best_project}
-
-    missing = [g for g in (gaps or []) if g.get('type') == 'missing']
-    transferable = [g for g in (gaps or []) if g.get('type') == 'transferable']
-    learnable = [g for g in (gaps or []) if g.get('type') == 'learnable']
-
-    if transferable:
-        top = transferable[0]; related = top.get('suggestion') or ""
-        text = (f"Type B — Highlight transferable experience: {related}. "
-                f"Suggested action: Move the related bullets to the top of your experience section and add a one-line summary in your resume summary.")
-        example_bullet = None
-        if projects:
-            sample = projects[0]; pname = sample.get('name') or "Project"
-            ptech = sample.get('technologies') or infer_techs_from_text((sample.get('description') or "") + " " + pname)
-            if ptech:
-                example_bullet = f"Collaborated on {pname} (used {', '.join(ptech[:4])}) to instrument and validate product flows with engineering partners."
-            else:
-                example_bullet = f"Collaborated on {pname} to instrument prototype and validate product flows with engineering partners."
-        return {"kind": "B", "text": text, "example_bullet": example_bullet}
-
-    if missing:
-        top_missing = [m['skill'] for m in missing[:3]]
-        stack = []
-        if any(re.search(r'\bdocker\b', s, flags=re.I) for s in top_missing): stack.append('Docker')
-        if any(re.search(r'\bpython\b|\bflask\b|\bfastapi\b', s, flags=re.I) for s in top_missing): stack.append('Python (Flask or FastAPI)')
-        if any(re.search(r'\bsql\b|\bpostgres\b|\bmysql\b|\bsqlite\b', s, flags=re.I) for s in top_missing): stack.append('SQLite / SQL')
-        if any(re.search(r'\baws\b|\bazure\b|\bgcp\b|\bcloud\b', s, flags=re.I) for s in top_missing): stack.append('Cloud (Render/Heroku/AWS Free Tier)')
-        if any(re.search(r'\bapi\b|\bbackend\b|\bserver\b|\bmicroservice\b', s, flags=re.I) for s in top_missing):
-            if 'Python (Flask or FastAPI)' not in stack: stack.append('Python (Flask or FastAPI)')
-        if not stack:
-            stack = ['Python (Flask)', 'SQLite', 'Docker', 'Deploy (Render/Heroku)']
-        micro_steps = [
-            f"1) Build a minimal REST API implementing one resource (e.g., inventory endpoint) using {stack[0]}.",
-            f"2) Persist sample data using {stack[1] if len(stack)>1 else 'SQLite'} (CRUD endpoints).",
-            "3) Add basic unit tests for the API endpoints (pytest).",
-            "4) Create a Dockerfile to containerize the service and verify it runs locally.",
-            f"5) Deploy the container to a free host (Render / Heroku / AWS free tier) and add a short README.",
-            "6) Add a measurable demo in README (curl examples) and include GitHub link in resume."
-        ]
-        micro_project = {"title": f"Micro-project targeted to: {', '.join(top_missing)}", "stack": stack, "steps": micro_steps}
-        job_title = job_parsed.get('title') or "the role"
-        example_bullet = (f"Built a {job_title}-relevant prototype (Flask API + SQLite + Docker); containerized and deployed the prototype and documented deployment steps.")
-        text = (f"Type C — Missing critical skills: {', '.join(top_missing)}. "
-                f"Suggested micro-project using: {', '.join(stack)}. Follow the steps below to produce an artifact you can link on your resume.")
-        return {"kind": "C", "text": text, "micro_project": micro_project, "example_bullet": example_bullet}
-
-    job_title = job_parsed.get('title') or job_parsed.get('role') or "this role"
-    ben = job_parsed.get('beneficial_skills') or []
-    ben_short = ", ".join(auto_normalize_skills(ben[:4])) if ben else "relevant beneficial skills"
-    text = (f"Type D — No clear project to reframe and no critical skills detected as missing. "
-            f"Suggested: pick a short micro-project that shows backend basics tailored to {job_title}: focus on {ben_short} and one backend stack (Python + Docker + SQL).")
-    micro_project = {"title": f"Starter micro-project for {job_title}", "stack": ["Python (Flask)", "SQLite", "Docker", "Deploy (Render)"], "steps": ["1) Create a simple Flask API.", "2) Store data using SQLite.", "3) Add Dockerfile and run locally.", "4) Deploy to Render/Heroku and add README."]}
-    example_bullet = "Built a small Flask + Docker prototype demonstrating an end-to-end API; documented deployment steps and linked GitHub."
-    return {"kind": "D", "text": text, "micro_project": micro_project, "example_bullet": example_bullet}
-
-# NL query simple handler (keeps deterministic answers for common intents)
-def handle_nl_query(session_parsed_resume, session_parsed_job, last_turns, query_text):
-    q = (query_text or "").lower()
-    if "skills" in q and "data science" in q:
-        have_python = any(normalize_token(s) == "python" for s in (session_parsed_resume.get('technical_skills',[]) if session_parsed_resume else []))
-        roadmap = ["Python (2-4 weeks)", "Pandas (2 weeks)", "Scikit-learn (3 weeks)"] if not have_python else ["Pandas (2 weeks)", "Scikit-learn (3 weeks)", "Feature engineering (2 weeks)"]
-        return {"intent":"skill_learning", "answer": roadmap}
-    if "ready" in q or "apply" in q:
-        if not session_parsed_resume or not session_parsed_job:
-            return {"intent":"readiness", "answer":"Need both resume and job in session for readiness check."}
-        mm = semantic_match_score(session_parsed_resume, session_parsed_job)
-        return {"intent":"readiness", "answer": f"Score {mm['score']} ({mm['rating']}).", "detail": mm}
-    gaps = gap_analysis(session_parsed_resume or {}, session_parsed_job or {}, top_n=5)
-    return {"intent":"skill_learning", "answer": [g['skill'] for g in gaps] or ["Specify domain for tailored roadmap."]}
-
-HF_TOKEN = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_API_TOKEN") or None
-HF_MODEL = os.environ.get("HF_NER_MODEL", "dbmdz/bert-large-cased-finetuned-conll03-english")
-HF_API_URL = os.environ.get("HF_API_URL", "https://api-inference.huggingface.co/models")
+    # split commas but prefer to keep multiword tokens together if they contain known words
+    out = []
+    for c in candidates:
+        # if the chunk contains common separators but also pattern 'X Y' keep it
+        # split only if splitting would create single-word tokens
+        parts = [p.strip() for p in re.split(r',\s*', c) if p.strip()]
+        if len(parts) > 1 and all(len(p.split()) == 1 for p in parts):
+            out += parts
+        else:
+            out.append(c)
+    # dedupe and return
+    seen = set(); final = []
+    for s in out:
+        key = s.lower().strip()
+        if key and key not in seen:
+            final.append(s.strip()); seen.add(key)
+    return final
 
 
+def _bullets_from_block(block_text):
+    """Return cleaned bullet lines from a block of text."""
+    if not block_text:
+        return []
+    cands = []
+    for ln in re.split(r'[\r\n]+', block_text):
+        if not ln or not ln.strip():
+            continue
+        s = ln.strip()
+        s = re.sub(r'^\s*[-•\*\u2022]\s*', '', s)
+        cands.append(s.strip())
+    return cands
+
+
+def parse_job_description_text(text: str) -> Dict[str, Any]:
+    """
+    Parse job description text into a normalized dict structure expected by matching/gap code.
+    Always returns a dict with keys: title, critical_skills (list), beneficial_skills (list),
+    responsibilities (list), experience (str), raw (original).
+    This is intentionally conservative and won't throw on unexpected text.
+    """
+    parsed = {"title": "", "critical_skills": [], "beneficial_skills": [], "responsibilities": [], "experience": "", "raw": text}
+    text = (text or "").strip()
+    if not text:
+        return parsed
+
+    # split into sections
+    sections = _split_sections_by_headings(text)
+
+    # title: try first line or section 'title'
+    first_line = text.splitlines()[0].strip()
+    parsed['title'] = sections.get('title', first_line) or first_line or "Job"
+
+    # responsibilities: if there's a Responsibilities section, split lines
+    resp_candidates = []
+    for k in sections:
+        if re.search(r"responsib", k, flags=re.I):
+            resp_candidates.append(sections[k])
+    if resp_candidates:
+        resp_text = "\n\n".join(resp_candidates)
+        parsed['responsibilities'] = [r.strip(" •-") for r in re.split(r'[\n\r]+', resp_text) if r.strip()]
+    else:
+        # as fallback, search for bullet-like lines under the body
+        body = sections.get('body', text)
+        bullets = [l.strip(" •-") for l in re.split(r'[\n\r]+', body) if len(l.strip()) > 20 and (l.strip().startswith("-") or l.strip().startswith("•") or ':' in l)]
+        parsed['responsibilities'] = bullets[:10]
+
+    # find explicit skill lines using simple heuristics
+    crit = []
+    ben = []
+    # look for lines that contain "required", "must have", "required skills"
+    for k, v in sections.items():
+        if re.search(r"required|must have|must-have|essential", k, flags=re.I) or re.search(r"required|must have|must-have|essential", v, flags=re.I):
+            crit += re.findall(r'([A-Za-z0-9\-\+\.& ]{2,80})', v)
+        if re.search(r"preferred|nice to have|beneficial|optional", k, flags=re.I) or re.search(r"preferred|nice to have|beneficial|optional", v, flags=re.I):
+            ben += re.findall(r'([A-Za-z0-9\-\+\.& ]{2,80})', v)
+
+    # fallback: look for skill words in whole text near 'skills' or 'responsibilities'
+    if not crit:
+        m = re.search(r'(skills[:\s]*)(.+?)(\n\n|$)', text, flags=re.I | re.S)
+        if m:
+            crit += re.split(r'[,\n;•\u2022]+', m.group(2))
+    if not ben:
+        m = re.search(r'(preferred[:\s]*)(.+?)(\n\n|$)', text, flags=re.I | re.S)
+        if m:
+            ben += re.split(r'[,\n;•\u2022]+', m.group(2))
+
+    def clean_skill_list(lst):
+        out = []
+        for s in lst:
+            if not s:
+                continue
+            s2 = s.strip().strip('•-–—. ')
+            # drop very long garbage
+            if len(s2) > 120:
+                continue
+            # drop purely sentence-like lines
+            if len(s2.split()) > 10:
+                continue
+            out.append(re.sub(r'\s{2,}', ' ', s2))
+        # dedupe preserving order
+        seen = set(); final = []
+        for it in out:
+            k = it.lower().strip()
+            if k and k not in seen:
+                final.append(it.strip()); seen.add(k)
+        return final
+
+    parsed['critical_skills'] = clean_skill_list(crit)[:50]
+    parsed['beneficial_skills'] = clean_skill_list(ben)[:50]
+
+    # experience: try find lines like "X years" or an experience/requirements section
+    exp = ""
+    exp_match = re.search(r'([0-9]+)\+?\s+years', text, flags=re.I)
+    if exp_match:
+        exp = exp_match.group(0)
+    else:
+        # look for 'experience' section content short summary
+        if 'experience' in sections:
+            exp = sections['experience'].strip().splitlines()[0][:200]
+    parsed['experience'] = exp
+
+    return parsed
+
+
+
+
+def _strip_think(text: str) -> str:
+    if not text:
+        return text
+    return re.sub(r"<think>.*?</think>", "", text, flags=re.S).strip()
+
+
+def build_gap_analysis_prompt(resume_parsed: dict, job_parsed: dict) -> str:
+    """
+    Builds a strict prompt for LLM-only skill gap analysis.
+    """
+
+    job_title = job_parsed.get("title", "the job role")
+    jd_skills = job_parsed.get("critical_skills", []) + job_parsed.get("beneficial_skills", [])
+    resume_skills = (
+        (resume_parsed.get("technical_skills") or []) +
+        (resume_parsed.get("soft_skills") or [])
+    )
+
+    resume_projects = resume_parsed.get("projects") or []
+    resume_summary = resume_parsed.get("summary") or ""
+
+    return f"""
+You are evaluating a candidate for the role: "{job_title}"
+
+JOB REQUIREMENTS (skills mentioned in the job description):
+{jd_skills}
+
+CANDIDATE RESUME SKILLS:
+{resume_skills}
+
+CANDIDATE SUMMARY:
+{resume_summary}
+
+CANDIDATE PROJECTS:
+{resume_projects}
+
+TASK:
+1. Identify skill gaps between the resume and the job.
+2. Decide the gap_type for each skill:
+   - "missing" (not present at all)
+   - "weak" (mentioned but not demonstrated clearly)
+3. For EACH skill gap, provide 1–2 concise, actionable recommendations
+   that help strengthen the job match.
+4. Recommendations must be resume-focused (what to add, clarify, or highlight).
+
+OUTPUT FORMAT (STRICT JSON ONLY):
+[
+  {{
+    "skill": "<skill name>",
+    "gap_type": "missing | weak",
+    "recommendations": [
+      "<recommendation 1>",
+      "<recommendation 2>"
+    ]
+  }}
+]
+
+IMPORTANT RULES:
+- Do NOT invent unrelated skills.
+- Do NOT include explanations outside JSON.
+- Do NOT include <think> tags.
+- Keep recommendations concise and job-relevant.
+"""
+
+def llm_gap_analysis(resume_parsed: dict, job_parsed: dict, max_items: int = 8):
+    """
+    LLM-only gap analysis. No KB. No rules. Single batched call.
+    """
+
+    prompt = build_gap_analysis_prompt(resume_parsed, job_parsed)
+
+    resp = ai_client.call_mixtral(
+        prompt=prompt,
+        system=LLM_SYSTEM_NO_THINK,
+        temperature=0.2,
+        max_tokens=700
+    )
+
+    raw_text = _strip_think(resp.get("text", ""))
+
+    try:
+        gaps = json.loads(raw_text)
+        if not isinstance(gaps, list):
+            return []
+
+        # defensive cleanup
+        cleaned = []
+        for g in gaps:
+            if not isinstance(g, dict):
+                continue
+            skill = g.get("skill")
+            gap_type = g.get("gap_type")
+            recs = g.get("recommendations")
+
+            if skill and gap_type in ("missing", "weak") and isinstance(recs, list):
+                cleaned.append({
+                    "skill": skill,
+                    "gap_type": gap_type,
+                    "recommendations": recs[:2]
+                })
+
+        return cleaned[:max_items]
+
+    except Exception:
+        # If model violates JSON contract, fail gracefully
+        return []
+    
+def build_query_prompt(question: str, resume_parsed: dict, job_parsed: dict) -> str:
+    return f"""
+You are answering a user's question about their job match.
+
+JOB TITLE:
+{job_parsed.get("title")}
+
+JOB REQUIREMENTS:
+{job_parsed.get("critical_skills")}
+
+RESUME SUMMARY:
+{resume_parsed.get("summary")}
+
+RESUME SKILLS:
+{resume_parsed.get("technical_skills")}
+
+QUESTION:
+{question}
+
+RULES:
+- Be concise and clear.
+- Do NOT reveal reasoning steps.
+- Do NOT include <think> tags.
+"""
+
+
+def llm_answer_query(question: str, resume_parsed: dict, job_parsed: dict) -> str:
+    resp = ai_client.call_mixtral(
+        prompt=build_query_prompt(question, resume_parsed, job_parsed),
+        system=LLM_SYSTEM_NO_THINK,
+        temperature=0.3,
+        max_tokens=300
+    )
+
+    return _strip_think(resp.get("text", "")).strip()
